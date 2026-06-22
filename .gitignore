@@ -1,0 +1,26 @@
+# --- Maven / Java build output ---
+target/
+*.class
+dependency-reduced-pom.xml
+
+# --- Secrets: never commit QWP/auth tokens ---
+*token*.txt
+qwp_token.txt
+
+# --- Store-and-forward spill dirs (local sender buffers) ---
+qwp_*_sf/
+*_sf/
+
+# --- Logs ---
+*.log
+
+# --- IDE ---
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
