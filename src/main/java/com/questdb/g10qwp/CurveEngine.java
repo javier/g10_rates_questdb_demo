@@ -37,10 +37,11 @@ public final class CurveEngine {
     private static final long CURVE_SEED = 0xC0FFEE5EEDL;
     private static final long GOLDEN = 0x9E3779B97F4A7C15L;
 
-    // Per-second factor vols (in % units). Small per second; accumulate to a few bp/day.
-    private static final double SIG_LEVEL = 0.0006;
-    private static final double SIG_SLOPE = 0.0005;
-    private static final double SIG_CURV = 0.0009;
+    // Per-second factor vols (in % units). Tuned for a visibly-moving demo (a "busy
+    // day", ~2bp/min on the belly); lower these for a calmer, more conservative tape.
+    private static final double SIG_LEVEL = 0.0024;
+    private static final double SIG_SLOPE = 0.0020;
+    private static final double SIG_CURV = 0.0036;
     private static final double SHOCK_PROB = 0.01;
     private static final double SHOCK_MULT = 6.0;
 

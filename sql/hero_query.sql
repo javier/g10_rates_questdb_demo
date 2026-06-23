@@ -38,10 +38,13 @@ SELECT
       + (-p.net_notional / 5.0e8) * 0.0001            AS quoted_mid,
     -- Implied hedge: offset the bucket DV01 in the nearest liquid future.
     -(p.net_notional * i.dv01_per_unit) / NULLIF(h.dv01_per_unit, 0) AS implied_hedge_notional
+-- ASOF joins come first so their left side keeps g10_rfqs' ascending designated
+-- timestamp; the dimension/axe joins follow (a regular JOIN before the ASOF can
+-- break the ASC order -> "left side of time series join doesn't have ASC ... order").
 FROM g10_rfqs r
-JOIN g10_instruments i        ON r.instrument_id = i.instrument_id
 ASOF JOIN g10_core_price m    ON (r.instrument_id = m.instrument_id)
 ASOF JOIN pos p               ON (r.instrument_id = p.instrument_id)
+JOIN g10_instruments i        ON r.instrument_id = i.instrument_id
 LEFT JOIN g10_axes a          ON (r.instrument_id = a.instrument_id)
 LEFT JOIN g10_instruments h   ON h.instrument_id = (
     -- nearest hedge future in the same ccy (precomputed in the generator; shown

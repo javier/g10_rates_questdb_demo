@@ -19,6 +19,12 @@ curve continuous from one second to the next and prevents pillars from crossing.
 DV01 is obtained by shifting the constructed curve by one basis point and repricing,
 so the risk figures are consistent with the prices and reproducible across runs.
 
+**Demo volatility.** The per-second factor volatilities in `CurveEngine`
+(`SIG_LEVEL`, `SIG_SLOPE`, `SIG_CURV`) are tuned up so the curve, candles and risk
+visibly move on screen during a live demo (roughly 2bp/min on the belly, a "busy
+day"). This is for show, not realism. Lower those constants for a calmer, more
+conservative tape.
+
 ## Tables and views
 
 | Object | Type | Role |
@@ -26,7 +32,7 @@ so the risk figures are consistent with the prices and reproducible across runs.
 | `g10_instruments` | base (static) | reference dimension; `dv01_per_unit` seeded from the curve |
 | `g10_market_data` | base | full-depth book snapshots (`DOUBLE[][]`) on futures and govvies; the high-volume table |
 | `g10_core_price` | base | consolidated best bid/offer and curve mids; the mid source for the central query |
-| `g10_quotes` | base | quotes: streaming (null `rfq_id`) and RFQ responses (non-null `rfq_id`) |
+| `g10_quotes` | base | quotes tagged by `quote_type`: `streaming` (the firehose) and `rfq_response` (set `rfq_id`) |
 | `g10_trades` | base | client fills and hedges; `TIMESTAMP_NS` |
 | `g10_rfqs` | base | inbound client requests |
 | `g10_axes` | base | desk directional interest |

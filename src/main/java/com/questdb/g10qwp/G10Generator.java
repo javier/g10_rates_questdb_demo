@@ -456,6 +456,7 @@ public final class G10Generator {
                 for (String platform : G10Universe.PLATFORMS) {
                     double skewPx = skewInPriceUnits(in, skewBps);
                     sender.table(cfg.quotesTable())
+                            .symbol("quote_type", "streaming")
                             .symbol("instrument_id", in.id)
                             .symbol("ccy", in.ccy)
                             .symbol("platform", platform)
@@ -517,6 +518,7 @@ public final class G10Generator {
                 double qSkewBps = inventorySkewBps(gi);
                 double qSkewPx = skewInPriceUnits(in, qSkewBps);
                 sender.table(cfg.quotesTable())
+                        .symbol("quote_type", "rfq_response")
                         .symbol("rfq_id", rfqId)
                         .symbol("instrument_id", in.id)
                         .symbol("ccy", in.ccy)
@@ -909,7 +911,7 @@ public final class G10Generator {
                     + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("3 DAYS"));
 
             execDdl(cfg.quotesTable(), "CREATE TABLE IF NOT EXISTS " + cfg.quotesTable() + " ("
-                    + "timestamp TIMESTAMP, quote_id UUID, rfq_id SYMBOL, "
+                    + "timestamp TIMESTAMP, quote_id UUID, quote_type SYMBOL, rfq_id SYMBOL, "
                     + "instrument_id SYMBOL CAPACITY 4096, ccy SYMBOL, platform SYMBOL, "
                     + "bid DOUBLE, ask DOUBLE, mid DOUBLE, skew_bps DOUBLE, valid_until TIMESTAMP"
                     + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("3 DAYS")
