@@ -39,7 +39,8 @@ public final class G10Cli {
     // --- mode / pools --------------------------------------------------------
     public String mode = null;                 // real-time | faster-than-life (required)
     public int marketDataProcesses = 2;        // fan-out pool for g10_market_data (0 = off)
-    public int businessProcesses = 1;          // single writer for the business tables (0 or 1)
+    public int coreProcesses = 1;              // writer pool for g10_core_price (0 = off)
+    public int businessProcesses = 1;          // single writer for quotes/trades/rfqs/axes (0 or 1)
 
     // --- volume / time -------------------------------------------------------
     public int marketDataMinEps = 1200;        // depth snapshots/sec across the pool
@@ -60,6 +61,7 @@ public final class G10Cli {
     public int runSecs = 0;                    // wall-clock stop (throughput tests)
     public int commitIntervalMs = 1000;
     public int marketDataCommitMs = 0;         // 0 = inherit commitIntervalMs
+    public int coreCommitMs = 0;
     public int businessCommitMs = 0;
     public int realtimeLookaheadSecs = 2;
 
@@ -124,6 +126,9 @@ public final class G10Cli {
                 case "market_data_processes":
                     c.marketDataProcesses = Integer.parseInt(req(args, ++i, raw));
                     break;
+                case "core_processes":
+                    c.coreProcesses = Integer.parseInt(req(args, ++i, raw));
+                    break;
                 case "business_processes":
                     c.businessProcesses = Integer.parseInt(req(args, ++i, raw));
                     break;
@@ -178,6 +183,9 @@ public final class G10Cli {
                     break;
                 case "market_data_commit_interval_ms":
                     c.marketDataCommitMs = Integer.parseInt(req(args, ++i, raw));
+                    break;
+                case "core_commit_interval_ms":
+                    c.coreCommitMs = Integer.parseInt(req(args, ++i, raw));
                     break;
                 case "business_commit_interval_ms":
                     c.businessCommitMs = Integer.parseInt(req(args, ++i, raw));
@@ -237,11 +245,14 @@ public final class G10Cli {
         if (marketDataProcesses < 0 || marketDataProcesses > 30) {
             fail("--market_data_processes must be between 0 and 30");
         }
+        if (coreProcesses < 0 || coreProcesses > 30) {
+            fail("--core_processes must be between 0 and 30");
+        }
         if (businessProcesses < 0 || businessProcesses > 1) {
             fail("--business_processes must be 0 or 1 (single-writer by design)");
         }
-        if (marketDataProcesses == 0 && businessProcesses == 0) {
-            fail("enable at least one pool (--market_data_processes and/or --business_processes > 0)");
+        if (marketDataProcesses == 0 && coreProcesses == 0 && businessProcesses == 0) {
+            fail("enable at least one pool (--market_data_processes, --core_processes and/or --business_processes > 0)");
         }
         if (marketDataProcesses > 0) {
             if (marketDataMinEps <= 0 || marketDataMaxEps < marketDataMinEps) {
@@ -251,7 +262,7 @@ public final class G10Cli {
                 fail("require 1 <= --min_levels <= --max_levels");
             }
         }
-        if (businessProcesses > 0 && (coreMinEps <= 0 || coreMaxEps < coreMinEps)) {
+        if (coreProcesses > 0 && (coreMinEps <= 0 || coreMaxEps < coreMinEps)) {
             fail("require 0 < --core_min_eps <= --core_max_eps");
         }
         if (autoFlushBytes < 1024) {
@@ -266,7 +277,7 @@ public final class G10Cli {
         if (realtimeLookaheadSecs < 0) {
             fail("--realtime_lookahead_secs must be >= 0");
         }
-        if (marketDataCommitMs < 0 || businessCommitMs < 0) {
+        if (marketDataCommitMs < 0 || coreCommitMs < 0 || businessCommitMs < 0) {
             fail("per-pool commit intervals must be >= 0 (0 = inherit --commit_interval_ms)");
         }
         if ("faster-than-life".equals(mode) && totalMarketDataEvents <= 0 && endTs == null && runSecs <= 0) {
@@ -304,6 +315,10 @@ public final class G10Cli {
 
     public int marketDataCommitIntervalMs() {
         return marketDataCommitMs > 0 ? marketDataCommitMs : commitIntervalMs;
+    }
+
+    public int coreCommitIntervalMs() {
+        return coreCommitMs > 0 ? coreCommitMs : commitIntervalMs;
     }
 
     public int businessCommitIntervalMs() {
@@ -403,7 +418,8 @@ public final class G10Cli {
                 "",
                 "Pools:",
                 "  --market_data_processes <n>   depth firehose workers, 0-30 (default 2; 0 = off)",
-                "  --business_processes <n>      business-tables writer, 0 or 1 (default 1)",
+                "  --core_processes <n>          g10_core_price writers, 0-30 (default 1; 0 = off)",
+                "  --business_processes <n>      quotes/trades/rfqs/axes writer, 0 or 1 (default 1)",
                 "",
                 "Volume / time:",
                 "  --market_data_min_eps / --market_data_max_eps   depth snapshots/sec (default 1200/15000)",

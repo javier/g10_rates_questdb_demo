@@ -44,7 +44,7 @@ public final class G10Generator {
     // Fixed load timestamp for the static dimension so re-seeds DEDUP to one row/instrument.
     private static final long INSTRUMENTS_LOAD_NS = 946_684_800L * NANOS_PER_SEC; // 2000-01-01
 
-    private enum Kind { MARKET_DATA, BUSINESS }
+    private enum Kind { MARKET_DATA, CORE_PRICE, BUSINESS }
 
     private final G10Cli cfg;
     private final List<Instrument> instruments = G10Universe.instruments();
@@ -57,6 +57,7 @@ public final class G10Generator {
 
     private final AtomicBoolean running = new AtomicBoolean(true);
     private final AtomicBoolean pausedMd = new AtomicBoolean(false);
+    private final AtomicBoolean pausedCore = new AtomicBoolean(false);
     private final AtomicBoolean pausedBiz = new AtomicBoolean(false);
     private final AtomicLong mdRows = new AtomicLong(0);
     private final AtomicLong coreRows = new AtomicLong(0);
@@ -65,6 +66,7 @@ public final class G10Generator {
     private final AtomicLong rfqRows = new AtomicLong(0);
     private final AtomicLong axeRows = new AtomicLong(0);
     private final AtomicLong mdFinishMs = new AtomicLong(0);
+    private final AtomicLong coreFinishMs = new AtomicLong(0);
     private final AtomicLong bizFinishMs = new AtomicLong(0);
 
     private G10Generator(G10Cli cfg) {
@@ -116,8 +118,8 @@ public final class G10Generator {
 
     private void run() throws Exception {
         System.out.println("=== qwp-g10-rates generator ===");
-        System.out.printf("mode=%s  hosts=%s  tls=%s  market_data_processes=%d  business_processes=%d%n",
-                cfg.mode, cfg.hosts, cfg.tls, cfg.marketDataProcesses, cfg.businessProcesses);
+        System.out.printf("mode=%s  hosts=%s  tls=%s  market_data_processes=%d  core_processes=%d  business_processes=%d%n",
+                cfg.mode, cfg.hosts, cfg.tls, cfg.marketDataProcesses, cfg.coreProcesses, cfg.businessProcesses);
         System.out.printf("universe: %d instruments (%d hedge/depth, %d quotable)%n",
                 instruments.size(), hedgeIdx.length, quotableIdx.length);
 
@@ -150,6 +152,7 @@ public final class G10Generator {
 
         List<Thread> workers = new ArrayList<>();
         workers.addAll(spawnMarketData(startNs, endNs, wallStartMs));
+        workers.addAll(spawnCore(startNs, endNs, wallStartMs));
         workers.addAll(spawnBusiness(startNs, endNs, wallStartMs));
         for (Thread th : workers) {
             th.join();
@@ -178,8 +181,9 @@ public final class G10Generator {
                 + rfqRows.get() + axeRows.get();
         System.out.printf("[DONE] in %.2fs wall — %,d rows total:%n", secs, total);
         printPoolDone("market_data", mdRows.get(), mdFinishMs.get(), wallStartMs);
-        System.out.printf("  business: core=%,d quotes=%,d trades=%,d rfqs=%,d axes=%,d%n",
-                coreRows.get(), quoteRows.get(), tradeRows.get(), rfqRows.get(), axeRows.get());
+        printPoolDone("core_price", coreRows.get(), coreFinishMs.get(), wallStartMs);
+        System.out.printf("  business: quotes=%,d trades=%,d rfqs=%,d axes=%,d%n",
+                quoteRows.get(), tradeRows.get(), rfqRows.get(), axeRows.get());
     }
 
     // ---------------------------------------------------------------- pools
@@ -194,6 +198,25 @@ public final class G10Generator {
         for (int w = 0; w < p; w++) {
             Worker worker = new Worker(Kind.MARKET_DATA, w, assign.get(w), startNs, endNs, wallStartMs);
             Thread th = new Thread(worker, "qwp-md-" + w);
+            threads.add(th);
+            th.start();
+        }
+        return threads;
+    }
+
+    private List<Thread> spawnCore(long startNs, Long endNs, long wallStartMs) {
+        List<Thread> threads = new ArrayList<>();
+        if (cfg.coreProcesses <= 0) {
+            return threads;
+        }
+        int[] all = new int[instruments.size()];
+        for (int i = 0; i < all.length; i++) {
+            all[i] = i;
+        }
+        List<List<Integer>> assign = snakeDraft(all, cfg.coreProcesses);
+        for (int w = 0; w < cfg.coreProcesses; w++) {
+            Worker worker = new Worker(Kind.CORE_PRICE, w, assign.get(w), startNs, endNs, wallStartMs);
+            Thread th = new Thread(worker, "qwp-core-" + w);
             threads.add(th);
             th.start();
         }
@@ -268,8 +291,9 @@ public final class G10Generator {
 
         @Override
         public void run() {
-            int commitMs = kind == Kind.MARKET_DATA
-                    ? cfg.marketDataCommitIntervalMs() : cfg.businessCommitIntervalMs();
+            int commitMs = kind == Kind.MARKET_DATA ? cfg.marketDataCommitIntervalMs()
+                    : kind == Kind.CORE_PRICE ? cfg.coreCommitIntervalMs()
+                    : cfg.businessCommitIntervalMs();
             boolean realtime = "real-time".equals(cfg.mode);
             try (Sender sender = buildSender(kind, id)) {
                 long base = alignToSecond(startNs);
@@ -314,8 +338,7 @@ public final class G10Generator {
             } catch (Exception e) {
                 System.err.printf("[%s worker %d] FATAL: %s%n", tag(kind), id, e.getMessage());
             } finally {
-                (kind == Kind.MARKET_DATA ? mdFinishMs : bizFinishMs)
-                        .accumulateAndGet(System.currentTimeMillis(), Math::max);
+                finishMsFor(kind).accumulateAndGet(System.currentTimeMillis(), Math::max);
                 bidArrays.values().forEach(DoubleArray::close);
                 askArrays.values().forEach(DoubleArray::close);
             }
@@ -326,8 +349,9 @@ public final class G10Generator {
             curve.beginSecond(k);
             if (kind == Kind.MARKET_DATA) {
                 emitDepth(sender, secondStartNs, k);
-            } else {
+            } else if (kind == Kind.CORE_PRICE) {
                 emitCore(sender, secondStartNs);
+            } else {
                 emitQuotes(sender, secondStartNs, k);
                 emitBusinessFlow(sender, secondStartNs);
             }
@@ -543,20 +567,41 @@ public final class G10Generator {
                     emitTrade(sender, secondStartNs + off + tradeOff++, in, rfqId,
                             clientBuy ? "sell" : "buy", notional, dealPx, client,
                             G10Universe.BOOKS[in.ccyIndex], false);
-                    // Implied hedge: offset DV01 in the nearest liquid future.
+                    // Implied hedge worked across the futures book in clips (realistic
+                    // multi-clip execution): a desk doesn't fill a large hedge in one
+                    // print, it sweeps several book levels. Each clip prints at a real
+                    // level price reconstructed from the same curve the depth feed uses,
+                    // so every hedge fill is on-book and defensible as a real fill.
                     int hf = nearestFuture(in.ccyIndex, in.tenorYears);
                     if (hf >= 0) {
                         Instrument fut = instruments.get(hf);
                         double[] fb = curve.betasAt(fut.ccyIndex, (double) off / NANOS_PER_SEC);
-                        double futPx = priceQuantized(fut, fb);
-                        double hedgeNotional = Math.abs(signedClient) * in.dv01PerUnit
-                                / Math.max(1e-12, fut.dv01PerUnit);
-                        hedgeNotional = Math.round(hedgeNotional / 1_000_000.0) * 1_000_000.0;
+                        double futMid = priceQuantized(fut, fb);
+                        double fHalf = halfSpread(fut);
                         boolean hedgeBuy = signedClient < 0;  // short risk -> buy futures to flatten
-                        inventory[hf] += hedgeBuy ? hedgeNotional : -hedgeNotional;
-                        emitTrade(sender, secondStartNs + off + tradeOff++, fut, rfqId,
-                                hedgeBuy ? "buy" : "sell", hedgeNotional, futPx, "HEDGE",
-                                G10Universe.BOOKS[fut.ccyIndex], true);
+                        double best = hedgeBuy
+                                ? G10Universe.quantizeToTick(futMid + fHalf, fut.tickSize)
+                                : G10Universe.quantizeToTick(futMid - fHalf, fut.tickSize);
+                        double remaining = Math.abs(signedClient) * in.dv01PerUnit
+                                / Math.max(1e-12, fut.dv01PerUnit);
+                        double filled = 0;
+                        int depth = Math.max(1, cfg.maxLevels);
+                        for (int lvl = 0; lvl < depth && remaining >= 1_000_000.0; lvl++) {
+                            double px = hedgeBuy
+                                    ? G10Universe.quantizeToTick(best + lvl * fut.tickSize, fut.tickSize)
+                                    : G10Universe.quantizeToTick(best - lvl * fut.tickSize, fut.tickSize);
+                            double lvlVol = G10Universe.volumeForLevel(lvl, ladder);
+                            double clip = Math.round(Math.min(remaining, lvlVol) / 1_000_000.0) * 1_000_000.0;
+                            if (clip < 1_000_000.0) {
+                                continue;
+                            }
+                            remaining -= clip;
+                            filled += clip;
+                            emitTrade(sender, secondStartNs + off + tradeOff++, fut, rfqId,
+                                    hedgeBuy ? "buy" : "sell", clip, px, "HEDGE",
+                                    G10Universe.BOOKS[fut.ccyIndex], true);
+                        }
+                        inventory[hf] += hedgeBuy ? filled : -filled;
                     }
                 }
             }
@@ -661,11 +706,17 @@ public final class G10Generator {
         }
 
         private void waitWhilePaused() throws InterruptedException {
-            AtomicBoolean flag = kind == Kind.MARKET_DATA ? pausedMd : pausedBiz;
+            AtomicBoolean flag = kind == Kind.MARKET_DATA ? pausedMd
+                    : kind == Kind.CORE_PRICE ? pausedCore : pausedBiz;
             while (flag.get() && running.get()) {
                 Thread.sleep(200);
             }
         }
+    }
+
+    private AtomicLong finishMsFor(Kind kind) {
+        return kind == Kind.MARKET_DATA ? mdFinishMs
+                : kind == Kind.CORE_PRICE ? coreFinishMs : bizFinishMs;
     }
 
     private static long[] sortedOffsets(int n) {
@@ -694,7 +745,7 @@ public final class G10Generator {
     }
 
     private static String tag(Kind kind) {
-        return kind == Kind.MARKET_DATA ? "md" : "biz";
+        return kind == Kind.MARKET_DATA ? "md" : kind == Kind.CORE_PRICE ? "core" : "biz";
     }
 
     // ---------------------------------------------------------------- reporting
@@ -729,7 +780,7 @@ public final class G10Generator {
     private Thread startHeartbeat() {
         Thread t = new Thread(() -> {
             long lastMs = System.currentTimeMillis();
-            long lastMd = 0, lastBiz = 0, elapsed = 0;
+            long lastMd = 0, lastCore = 0, lastBiz = 0, elapsed = 0;
             try {
                 while (running.get()) {
                     long target = 10_000, slept = 0;
@@ -744,16 +795,18 @@ public final class G10Generator {
                     long now = System.currentTimeMillis();
                     double dt = Math.max(1, (now - lastMs) / 1000.0);
                     long nowMd = mdRows.get();
-                    long nowBiz = coreRows.get() + quoteRows.get() + tradeRows.get()
-                            + rfqRows.get() + axeRows.get();
+                    long nowCore = coreRows.get();
+                    long nowBiz = quoteRows.get() + tradeRows.get() + rfqRows.get() + axeRows.get();
                     elapsed += Math.round(dt);
-                    System.out.printf("[hb] t=%ds  md %,d/s (%,d)  business %,d/s (%,d)  "
-                                    + "[core=%,d q=%,d trd=%,d rfq=%,d axe=%,d]%n",
+                    System.out.printf("[hb] t=%ds  md %,d/s (%,d)  core %,d/s (%,d)  business %,d/s (%,d)  "
+                                    + "[q=%,d trd=%,d rfq=%,d axe=%,d]%n",
                             elapsed, Math.round((nowMd - lastMd) / dt), nowMd,
+                            Math.round((nowCore - lastCore) / dt), nowCore,
                             Math.round((nowBiz - lastBiz) / dt), nowBiz,
-                            coreRows.get(), quoteRows.get(), tradeRows.get(), rfqRows.get(), axeRows.get());
+                            quoteRows.get(), tradeRows.get(), rfqRows.get(), axeRows.get());
                     lastMs = now;
                     lastMd = nowMd;
+                    lastCore = nowCore;
                     lastBiz = nowBiz;
                 }
             } catch (InterruptedException e) {
@@ -902,14 +955,15 @@ public final class G10Generator {
                     + "best_bid DOUBLE PARQUET(default, zstd(4)), best_ask DOUBLE PARQUET(default, zstd(4))"
                     + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("3 DAYS"));
         }
-        if (cfg.businessProcesses > 0) {
+        if (cfg.coreProcesses > 0) {
             execDdl(cfg.corePriceTable(), "CREATE TABLE IF NOT EXISTS " + cfg.corePriceTable() + " ("
                     + "timestamp TIMESTAMP PARQUET(delta_binary_packed, zstd(4)), "
                     + "instrument_id SYMBOL CAPACITY 4096 PARQUET(rle_dictionary, zstd(4), bloom_filter), "
                     + "ccy SYMBOL PARQUET(rle_dictionary, zstd(4)), basis SYMBOL PARQUET(rle_dictionary, zstd(4)), "
                     + "bid DOUBLE, ask DOUBLE, mid DOUBLE, bid_sz DOUBLE, ask_sz DOUBLE"
                     + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("3 DAYS"));
-
+        }
+        if (cfg.businessProcesses > 0) {
             execDdl(cfg.quotesTable(), "CREATE TABLE IF NOT EXISTS " + cfg.quotesTable() + " ("
                     + "timestamp TIMESTAMP, quote_id UUID, quote_type SYMBOL, rfq_id SYMBOL, "
                     + "instrument_id SYMBOL CAPACITY 4096, ccy SYMBOL, platform SYMBOL, "
@@ -944,34 +998,38 @@ public final class G10Generator {
      * refreshes hang off the low-volume bases, never the depth feed (§13.6).
      */
     private void createViews() {
-        if (!cfg.createViews || cfg.businessProcesses <= 0) {
+        if (!cfg.createViews) {
             return;
         }
         String trades = cfg.tradesTable();
         String instr = cfg.instrumentsTable();
         String core = cfg.corePriceTable();
 
-        execDdl("g10_positions" + cfg.suffix, "CREATE VIEW IF NOT EXISTS 'g10_positions" + cfg.suffix + "' AS ("
-                + "SELECT timestamp, book, instrument_id, "
-                + "sum(CASE WHEN side='buy' THEN notional ELSE -notional END) "
-                + "OVER (PARTITION BY book, instrument_id ORDER BY timestamp) AS net_notional "
-                + "FROM " + trades + ")");
+        if (cfg.businessProcesses > 0) {
+            execDdl("g10_positions" + cfg.suffix, "CREATE VIEW IF NOT EXISTS 'g10_positions" + cfg.suffix + "' AS ("
+                    + "SELECT timestamp, book, instrument_id, "
+                    + "sum(CASE WHEN side='buy' THEN notional ELSE -notional END) "
+                    + "OVER (PARTITION BY book, instrument_id ORDER BY timestamp) AS net_notional "
+                    + "FROM " + trades + ")");
 
-        // Trade-driven MV: risk FLOW per (ccy, tenor_bucket, book) per second. WITH BASE
-        // is required because the query joins the instruments dimension.
-        execDdl("g10_pos_risk" + cfg.suffix, "CREATE MATERIALIZED VIEW IF NOT EXISTS 'g10_pos_risk" + cfg.suffix
-                + "' WITH BASE '" + trades + "' REFRESH IMMEDIATE AS ("
-                + "SELECT t.timestamp, t.book, i.ccy, i.tenor_bucket, "
-                + "sum((CASE WHEN t.side='buy' THEN 1 ELSE -1 END) * t.notional * i.dv01_per_unit) AS dv01_flow "
-                + "FROM " + trades + " t JOIN " + instr + " i ON t.instrument_id = i.instrument_id "
-                + "SAMPLE BY 1s) PARTITION BY HOUR" + mvRetentionClause("3 DAYS"));
+            // Trade-driven MV: risk FLOW per (ccy, tenor_bucket, book) per second. WITH BASE
+            // is required because the query joins the instruments dimension.
+            execDdl("g10_pos_risk" + cfg.suffix, "CREATE MATERIALIZED VIEW IF NOT EXISTS 'g10_pos_risk" + cfg.suffix
+                    + "' WITH BASE '" + trades + "' REFRESH IMMEDIATE AS ("
+                    + "SELECT t.timestamp, t.book, i.ccy, i.tenor_bucket, "
+                    + "sum((CASE WHEN t.side='buy' THEN 1 ELSE -1 END) * t.notional * i.dv01_per_unit) AS dv01_flow "
+                    + "FROM " + trades + " t JOIN " + instr + " i ON t.instrument_id = i.instrument_id "
+                    + "SAMPLE BY 1s) PARTITION BY HOUR" + mvRetentionClause("3 DAYS"));
+        }
 
         // Curve-mid candles (IMMEDIATE off the low-volume core_price table).
-        execDdl("g10_curve_mid_1m" + cfg.suffix, "CREATE MATERIALIZED VIEW IF NOT EXISTS 'g10_curve_mid_1m"
-                + cfg.suffix + "' WITH BASE '" + core + "' REFRESH IMMEDIATE AS ("
-                + "SELECT timestamp, instrument_id, first(mid) AS open, max(mid) AS high, "
-                + "min(mid) AS low, last(mid) AS close FROM " + core + " SAMPLE BY 1m"
-                + ") PARTITION BY HOUR" + mvRetentionClause("3 DAYS"));
+        if (cfg.coreProcesses > 0) {
+            execDdl("g10_curve_mid_1m" + cfg.suffix, "CREATE MATERIALIZED VIEW IF NOT EXISTS 'g10_curve_mid_1m"
+                    + cfg.suffix + "' WITH BASE '" + core + "' REFRESH IMMEDIATE AS ("
+                    + "SELECT timestamp, instrument_id, first(mid) AS open, max(mid) AS high, "
+                    + "min(mid) AS low, last(mid) AS close FROM " + core + " SAMPLE BY 1m"
+                    + ") PARTITION BY HOUR" + mvRetentionClause("3 DAYS"));
+        }
 
         // BBO rollup over the depth feed — TIMER refresh, never IMMEDIATE (§13.6).
         if (cfg.marketDataProcesses > 0) {
@@ -1045,6 +1103,11 @@ public final class G10Generator {
             flags.add(pausedMd);
             tables.add(cfg.marketDataTable());
             thresholds.add((cfg.marketDataProcesses > 2 ? 3 : 5) * cfg.marketDataProcesses);
+        }
+        if (cfg.coreProcesses > 0) {
+            flags.add(pausedCore);
+            tables.add(cfg.corePriceTable());
+            thresholds.add((cfg.coreProcesses > 2 ? 3 : 5) * cfg.coreProcesses);
         }
         if (cfg.businessProcesses > 0) {
             flags.add(pausedBiz);

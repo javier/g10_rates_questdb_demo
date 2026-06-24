@@ -11,7 +11,7 @@ CLIENT_VERSION="${CLIENT_VERSION:-1.3.2}"
 
 mvn -q -f ./pom.xml -Dquestdb.client.version="${CLIENT_VERSION}" compile exec:java -Dexec.args="--mode real-time \
     --hosts ${HOSTS} \
-    --market_data_processes 2 --business_processes 1 \
+    --market_data_processes 2 --core_processes 1 --business_processes 1 \
     --market_data_min_eps 8000 --market_data_max_eps 12000 \
     --min_levels 10 --max_levels 10 \
     --core_min_eps 800 --core_max_eps 1400 \
