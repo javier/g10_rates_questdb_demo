@@ -1290,17 +1290,25 @@ public final class G10Generator {
         Long latest = poolMaxNanos(kind);
         long startNs = cfg.startTs != null ? isoToNanos(cfg.startTs)
                 : (latest != null ? nextSecond(latest) : nowNs());
+        boolean resumed = false;
         if (latest != null) {
-            long resume = nextSecond(latest);   // skip the partial last second (no re-emit)
+            long resume = nextSecond(latest);   // resume past the last full second (no re-emit)
             if (resume > startNs) {
-                System.out.printf("[INFO] %s: resuming from %s (past its own last row).%n",
-                        tag(kind), nanosToIso(resume));
                 startNs = resume;
+                resumed = true;
             }
         }
+        // Check the end-of-window skip BEFORE printing a resume line, so a pool that
+        // is already complete shows exactly one (correct) line instead of a
+        // "resuming..." immediately contradicted by "skipping".
         if (endNs != null && startNs >= endNs) {
-            System.out.printf("[INFO] %s already filled to --end_ts; skipping.%n", tag(kind));
+            System.out.printf("[INFO] %s: already filled to --end_ts (%s); skipping.%n",
+                    tag(kind), nanosToIso(endNs));
             return null;
+        }
+        if (resumed) {
+            System.out.printf("[INFO] %s: resuming from %s (past its own last row).%n",
+                    tag(kind), nanosToIso(startNs));
         }
         return startNs;
     }
