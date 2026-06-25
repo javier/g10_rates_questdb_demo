@@ -137,9 +137,14 @@ public final class G10Generator {
         seedInstruments();
         createViews();
 
-        // 3) Data-clock start with the same overlap safety as the FX generator.
+        // 3) Data-clock start. In faster-than-life each pool resumes from ITS OWN
+        //    table's max, not a global max across tables: the pools race at different
+        //    rates, so advancing every pool to the furthest table would skip the
+        //    slower one (market_data) over data it never wrote -> gaps. Per-pool
+        //    resume fills every table continuously from its own last row, no overlap.
         Long endNs = cfg.endTs == null ? null : isoToNanos(cfg.endTs);
-        long startNs = resolveStartNanos(endNs);
+        this.endNsField = endNs;
+        boolean ftl = "faster-than-life".equals(cfg.mode);
 
         long wallStartMs = System.currentTimeMillis();
         long t0 = System.nanoTime();
@@ -151,9 +156,34 @@ public final class G10Generator {
         Thread walMonitor = startWalMonitor();
 
         List<Thread> workers = new ArrayList<>();
-        workers.addAll(spawnMarketData(startNs, endNs, wallStartMs));
-        workers.addAll(spawnCore(startNs, endNs, wallStartMs));
-        workers.addAll(spawnBusiness(startNs, endNs, wallStartMs));
+        if (ftl) {
+            if (cfg.marketDataProcesses > 0) {
+                Long s = poolStartFtl(Kind.MARKET_DATA, endNs);
+                if (s != null) {
+                    workers.addAll(spawnMarketData(s, endNs, wallStartMs));
+                }
+            }
+            if (cfg.coreProcesses > 0) {
+                Long s = poolStartFtl(Kind.CORE_PRICE, endNs);
+                if (s != null) {
+                    workers.addAll(spawnCore(s, endNs, wallStartMs));
+                }
+            }
+            if (cfg.businessProcesses > 0) {
+                Long s = poolStartFtl(Kind.BUSINESS, endNs);
+                if (s != null) {
+                    workers.addAll(spawnBusiness(s, endNs, wallStartMs));
+                }
+            }
+            if (workers.isEmpty()) {
+                System.out.println("[INFO] all enabled pools already filled to --end_ts. Nothing to do.");
+            }
+        } else {
+            long startNs = resolveStartNanos(endNs);   // real-time: global wait-past-latest
+            workers.addAll(spawnMarketData(startNs, endNs, wallStartMs));
+            workers.addAll(spawnCore(startNs, endNs, wallStartMs));
+            workers.addAll(spawnBusiness(startNs, endNs, wallStartMs));
+        }
         for (Thread th : workers) {
             th.join();
         }
@@ -1241,11 +1271,59 @@ public final class G10Generator {
         if (cfg.marketDataProcesses > 0) {
             latest = maxOf(latest, readMaxTimestampNanos(cfg.marketDataTable(), true));
         }
-        if (cfg.businessProcesses > 0) {
-            latest = maxOf(latest, readMaxTimestampNanos(cfg.tradesTable(), false)); // ns
+        if (cfg.coreProcesses > 0) {
             latest = maxOf(latest, readMaxTimestampNanos(cfg.corePriceTable(), true)); // micros
         }
+        if (cfg.businessProcesses > 0) {
+            latest = maxOf(latest, readMaxTimestampNanos(cfg.tradesTable(), false)); // ns
+        }
         return latest;
+    }
+
+    /**
+     * Faster-than-life resume start for one pool, from that pool's OWN table max so
+     * each table fills continuously from where it left off, with no cross-table gaps
+     * and no overlap. Returns {@code null} if this pool is already filled to
+     * {@code endNs} (skip it).
+     */
+    private Long poolStartFtl(Kind kind, Long endNs) {
+        Long latest = poolMaxNanos(kind);
+        long startNs = cfg.startTs != null ? isoToNanos(cfg.startTs)
+                : (latest != null ? nextSecond(latest) : nowNs());
+        if (latest != null) {
+            long resume = nextSecond(latest);   // skip the partial last second (no re-emit)
+            if (resume > startNs) {
+                System.out.printf("[INFO] %s: resuming from %s (past its own last row).%n",
+                        tag(kind), nanosToIso(resume));
+                startNs = resume;
+            }
+        }
+        if (endNs != null && startNs >= endNs) {
+            System.out.printf("[INFO] %s already filled to --end_ts; skipping.%n", tag(kind));
+            return null;
+        }
+        return startNs;
+    }
+
+    /** max(timestamp) in nanos across the table(s) a pool writes, or null if empty. */
+    private Long poolMaxNanos(Kind kind) {
+        switch (kind) {
+            case MARKET_DATA:
+                return readMaxTimestampNanos(cfg.marketDataTable(), true);
+            case CORE_PRICE:
+                return readMaxTimestampNanos(cfg.corePriceTable(), true);
+            default:  // BUSINESS writes several tables on one shared data-clock
+                Long m = readMaxTimestampNanos(cfg.tradesTable(), false);   // TIMESTAMP_NS
+                m = maxOf(m, readMaxTimestampNanos(cfg.quotesTable(), true));
+                m = maxOf(m, readMaxTimestampNanos(cfg.rfqsTable(), true));
+                m = maxOf(m, readMaxTimestampNanos(cfg.axesTable(), true));
+                return m;
+        }
+    }
+
+    /** Next whole-second boundary strictly after {@code ns}. */
+    private static long nextSecond(long ns) {
+        return ((ns / NANOS_PER_SEC) + 1) * NANOS_PER_SEC;
     }
 
     private static long nowNs() {
