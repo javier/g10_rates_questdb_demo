@@ -1011,12 +1011,12 @@ public final class G10Generator {
             execDdl(cfg.rfqsTable(), "CREATE TABLE IF NOT EXISTS " + cfg.rfqsTable() + " ("
                     + "timestamp TIMESTAMP, rfq_id SYMBOL, client_id SYMBOL, platform SYMBOL, ccy SYMBOL, "
                     + "tenor SYMBOL, instrument_id SYMBOL CAPACITY 4096, side SYMBOL, notional DOUBLE, status SYMBOL"
-                    + ") timestamp(timestamp) PARTITION BY DAY" + retentionClause("1 MONTH"));
+                    + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("1 MONTH"));
 
             execDdl(cfg.axesTable(), "CREATE TABLE IF NOT EXISTS " + cfg.axesTable() + " ("
                     + "timestamp TIMESTAMP, instrument_id SYMBOL CAPACITY 4096, ccy SYMBOL, tenor_bucket SYMBOL, "
                     + "direction SYMBOL, size DOUBLE, skew_bps DOUBLE, priority LONG, active_until TIMESTAMP"
-                    + ") timestamp(timestamp) PARTITION BY DAY" + retentionClause("1 MONTH"));
+                    + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("1 MONTH"));
         }
     }
 
