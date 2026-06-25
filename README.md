@@ -33,7 +33,7 @@ conservative tape.
 | `g10_market_data` | base | full-depth book snapshots (`DOUBLE[][]`) on futures and govvies; the high-volume table |
 | `g10_core_price` | base | consolidated best bid/offer and curve mids; the mid source for the central query |
 | `g10_quotes` | base | quotes tagged by `quote_type`: `streaming` (the firehose) and `rfq_response` (set `rfq_id`) |
-| `g10_trades` | base | client fills and hedges; `TIMESTAMP_NS` |
+| `g10_trades` | base | client fills and multi-clip hedges swept across the futures book; `TIMESTAMP_NS` |
 | `g10_rfqs` | base | inbound client requests |
 | `g10_axes` | base | desk directional interest |
 | `g10_positions` | regular view | running net position over trades (cumulative, so it cannot be a materialized view) |
@@ -42,6 +42,24 @@ conservative tape.
 
 Target volume ordering: `g10_market_data` is the largest table, then `g10_core_price`,
 then `g10_quotes`, then `g10_trades`. Trade counts are kept deliberately low.
+
+## Writer pools
+
+Ingestion is split across three independent writer pools, each with its own QWP
+senders, so the heavy table never starves the others:
+
+- **market_data** (`--market_data_processes`) the depth firehose; the only pool that
+  fans out to multiple WAL writers. One writer keeps the table free of out-of-order
+  apply; add writers only if a single one cannot keep up.
+- **core_price** (`--core_processes`) the consolidated best bid/offer and curve mids.
+- **business** (`--business_processes`, 0 or 1) a single writer for the low-volume
+  tables the central query joins: quotes, trades, rfqs and axes.
+
+In faster-than-life each pool resumes from its own table's last timestamp, so an
+interrupted backfill continues with no gap or overlap, and a pool already filled to
+`--end_ts` is skipped. In real-time every pool advances one simulated second per
+wall-clock second, stamped `--realtime_lookahead_secs` ahead (default 2s) so a live
+dashboard stays ahead of WAL apply.
 
 ## Timestamp resolution
 

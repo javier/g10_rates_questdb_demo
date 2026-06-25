@@ -9,16 +9,18 @@ import java.util.List;
 
 /**
  * Command-line configuration for the G10 rates generator. Mirrors the FX/QWP
- * generator's flag surface and HA/auth model, with two pools:
+ * generator's flag surface and HA/auth model, with three writer pools:
  *
  * <ul>
  *   <li><b>market_data</b> — the only fan-out pool; depth snapshots on the liquid
  *       futures/govvies (the ~1B rows/day firehose). Snapshots are full-depth
  *       {@code DOUBLE[][]} arrays (1 row = 1 book), the fast QWP path.</li>
- *   <li><b>business</b> — a single writer for the low-volume tables that the hero
- *       query joins: {@code g10_core_price}, {@code g10_quotes}, {@code g10_trades},
- *       {@code g10_rfqs}, {@code g10_axes}. Single-writer per §13.4 (only the
- *       dominant table gets multiple WAL writers).</li>
+ *   <li><b>core_price</b> — its own writer for {@code g10_core_price}, the
+ *       consolidated best bid/offer and curve mids that feed the central query.</li>
+ *   <li><b>business</b> — a single writer for the remaining low-volume tables the
+ *       hero query joins: {@code g10_quotes}, {@code g10_trades}, {@code g10_rfqs},
+ *       {@code g10_axes}. Single-writer per §13.4 (only the dominant table gets
+ *       multiple WAL writers).</li>
  * </ul>
  *
  * Option names accept Python underscore or kebab form.

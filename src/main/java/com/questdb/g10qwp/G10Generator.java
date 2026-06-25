@@ -823,6 +823,17 @@ public final class G10Generator {
                         break;
                     }
                     long now = System.currentTimeMillis();
+                    long waitUntil = overlapWaitUntilMs;
+                    if (waitUntil > now) {
+                        System.out.printf("[hb] waiting %ds to avoid overlap with existing data "
+                                        + "(ingestion not started yet)%n",
+                                (waitUntil - now + 999) / 1000);
+                        lastMs = now;
+                        lastMd = mdRows.get();
+                        lastCore = coreRows.get();
+                        lastBiz = quoteRows.get() + tradeRows.get() + rfqRows.get() + axeRows.get();
+                        continue;
+                    }
                     double dt = Math.max(1, (now - lastMs) / 1000.0);
                     long nowMd = mdRows.get();
                     long nowCore = coreRows.get();
@@ -905,6 +916,7 @@ public final class G10Generator {
     }
 
     private Long endNsField;  // set in run() so pastEnd has it without threading through
+    private volatile long overlapWaitUntilMs = 0L;  // >0 while real-time waits past existing data
 
     // ---------------------------------------------------------------- transport / DDL
 
@@ -1251,10 +1263,14 @@ public final class G10Generator {
                 double waitSecs = (next - now) / 1e9;
                 System.out.printf("[INFO] Last row is %s. Waiting %.1fs to avoid overlap...%n",
                         nanosToIso(latest), waitSecs);
+                long sleepMs = (long) Math.ceil(waitSecs * 1000.0);
+                overlapWaitUntilMs = System.currentTimeMillis() + sleepMs;
                 try {
-                    Thread.sleep((long) Math.ceil(waitSecs * 1000.0));
+                    Thread.sleep(sleepMs);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                } finally {
+                    overlapWaitUntilMs = 0L;
                 }
             }
         }
