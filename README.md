@@ -92,6 +92,23 @@ and in `sql/hero_query.sql`:
    view holds risk flow per interval, because a SAMPLE BY materialized view cannot
    hold a running cumulative.
 
+## Retention and storage tiers
+
+Retention is attached only with `--short_ttl`; without it the tables carry no TTL and
+nothing is dropped.
+
+- **Open source:** retention is a plain `TTL`. Once a partition ages past the TTL it is
+  dropped and the data is gone. Cold / tiered storage is not available on OSS.
+- **Enterprise (`--enterprise true`, together with `--short_ttl`):** retention is a
+  `STORAGE POLICY` instead. Partitions tier on a schedule (convert to Parquet, upload to
+  remote object storage), and `DROP LOCAL` frees the local copy once the data is on
+  remote. After the local drop the data is still served, transparently, from remote, so a
+  single query spanning hot (local) and cold (remote) partitions just works.
+
+`g10_market_data` carries its own policy, `DROP LOCAL 4 days`: it grows ~830M rows/day, so
+this bounds its local footprint while the full history stays queryable on remote. The
+smaller tables keep `DROP LOCAL 3 months`, and the materialized views keep a 10-day `TTL`.
+
 ## Build and run
 
 ```bash
