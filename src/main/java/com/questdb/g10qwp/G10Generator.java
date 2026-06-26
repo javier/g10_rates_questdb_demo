@@ -41,6 +41,10 @@ public final class G10Generator {
     private static final long NANOS_PER_SEC = 1_000_000_000L;
     private static final String ENTERPRISE_POLICY =
             "TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 3 months";
+    // g10_market_data grows ~830M rows/day, so it drops its local copy after 4 days
+    // (still queryable from remote/parquet); the small tables keep the longer policy.
+    private static final String MARKET_DATA_POLICY =
+            "TO REMOTE 1 hour, TO PARQUET 2 days, DROP LOCAL 4 days";
     // Fixed load timestamp for the static dimension so re-seeds DEDUP to one row/instrument.
     private static final long INSTRUMENTS_LOAD_NS = 946_684_800L * NANOS_PER_SEC; // 2000-01-01
 
@@ -1015,10 +1019,14 @@ public final class G10Generator {
     }
 
     private String retentionClause(String ossTtl) {
+        return retentionClause(ossTtl, ENTERPRISE_POLICY);
+    }
+
+    private String retentionClause(String ossTtl, String enterprisePolicy) {
         if (!cfg.shortTtl) {
             return "";
         }
-        return cfg.enterprise ? " STORAGE POLICY(" + ENTERPRISE_POLICY + ")" : " TTL " + ossTtl;
+        return cfg.enterprise ? " STORAGE POLICY(" + enterprisePolicy + ")" : " TTL " + ossTtl;
     }
 
     private String mvRetentionClause(String ossTtl) {
@@ -1040,7 +1048,7 @@ public final class G10Generator {
                     + "venue SYMBOL PARQUET(rle_dictionary, zstd(4)), basis SYMBOL PARQUET(rle_dictionary, zstd(4)), "
                     + "bids DOUBLE[][] PARQUET(default, zstd(4)), asks DOUBLE[][] PARQUET(default, zstd(4)), "
                     + "best_bid DOUBLE PARQUET(default, zstd(4)), best_ask DOUBLE PARQUET(default, zstd(4))"
-                    + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("3 DAYS"));
+                    + ") timestamp(timestamp) PARTITION BY HOUR" + retentionClause("4 DAYS", MARKET_DATA_POLICY));
         }
         if (cfg.coreProcesses > 0) {
             execDdl(cfg.corePriceTable(), "CREATE TABLE IF NOT EXISTS " + cfg.corePriceTable() + " ("
