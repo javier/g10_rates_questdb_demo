@@ -410,13 +410,14 @@ public final class G10Generator {
                 Instrument in = instruments.get(gi);
                 double[] betas = curve.betasAt(in.ccyIndex, (double) off / NANOS_PER_SEC);
                 double mid = G10Universe.quantizeToTick(curve.mid(in, betas), in.tickSize);
-                emitSnapshot(sender, ts, in, mid);
+                emitSnapshot(sender, ts, gi, in, mid);
                 mdRows.incrementAndGet();
             }
         }
 
-        private void emitSnapshot(Sender sender, long ts, Instrument in, double mid) {
-            int levels = ThreadLocalRandom.current().nextInt(cfg.minLevels, cfg.maxLevels + 1);
+        private void emitSnapshot(Sender sender, long ts, int gi, Instrument in, double mid) {
+            long sec = ts / NANOS_PER_SEC;
+            int levels = bookLevels(in, gi, sec);
             double half = halfSpread(in);
             double bestBid = G10Universe.quantizeToTick(mid - half, in.tickSize);
             double bestAsk = G10Universe.quantizeToTick(mid + half, in.tickSize);
@@ -431,10 +432,10 @@ public final class G10Generator {
                 asks.append(G10Universe.quantizeToTick(bestAsk + i * in.tickSize, in.tickSize));
             }
             for (int i = 0; i < levels; i++) {
-                bids.append((double) G10Universe.volumeForLevel(i, ladder));
+                bids.append(levelSize(in, gi, i, sec, 0));
             }
             for (int i = 0; i < levels; i++) {
-                asks.append((double) G10Universe.volumeForLevel(i, ladder));
+                asks.append(levelSize(in, gi, i, sec, 1));
             }
             sender.table(cfg.marketDataTable())
                     .symbol("instrument_id", in.id)
@@ -709,6 +710,50 @@ public final class G10Generator {
         private double bpMove(Instrument in, double mid, double prev) {
             return in.isRate() ? Math.abs(mid - prev) / 0.01
                     : Math.abs(mid - prev) / Math.max(1e-9, in.dv01PerUnit * 100.0);
+        }
+
+        // Coherent order book: the number of levels and each level's size are smooth,
+        // deterministic functions of (instrument, second). Consecutive snapshots therefore
+        // line up -- the book holds its shape instead of re-randomizing on every row, which
+        // is what made the depth panel jump on every refresh -- and any worker rebuilds the
+        // identical book. Sizes are front-loaded (heaviest at the touch, thinning into the
+        // book) so the cumulative-depth staircase shows every level, not one deep wall.
+
+        // Each instrument carries a CHARACTERISTIC depth set by its liquidity, stable over
+        // time with only mild, quasi-irregular thickening/thinning -- real books don't
+        // sweep 5<->20 on a clean cycle. Setting --min_levels == --max_levels pins every
+        // book to that fixed depth (e.g. 2 for a shallow count/tiering backfill, then go
+        // live with 5..20 for the depth dashboard).
+        private int bookLevels(Instrument in, int gi, long sec) {
+            int span = cfg.maxLevels - cfg.minLevels;
+            if (span <= 0) {
+                return cfg.minLevels;   // override: fixed depth (shallow backfill / forced depth)
+            }
+            double base = cfg.minLevels + liquidity(in) * span;   // liquid instruments sit deep
+            double jitter = 0.12 * span * (Math.sin(2.0 * Math.PI * sec / 41.0 + gi)
+                                         + 0.5 * Math.sin(2.0 * Math.PI * sec / 97.0 + gi * 2.0));
+            int n = (int) Math.round(base + jitter);
+            return Math.max(cfg.minLevels, Math.min(cfg.maxLevels, n));
+        }
+
+        // 0 (thin) .. 1 (deepest). Futures carry the deepest books; the belly is deeper
+        // than the wings.
+        private double liquidity(Instrument in) {
+            double base = "FUTURE".equals(in.product) ? 0.9 : 0.6;
+            double belly = 1.0 - Math.min(0.45, Math.abs(in.tenorYears - 7.0) / 30.0);
+            return Math.max(0.15, Math.min(1.0, base * belly));
+        }
+
+        private double levelSize(Instrument in, int gi, int level, long sec, int side) {
+            double base = in.isRate() ? 45_000_000.0 : 20_000_000.0;        // top-of-book clip, by product
+            double profile = 1.0 / (1.0 + 0.22 * level);                    // thins into the book
+            double drift = 1.0 + 0.10 * Math.sin(2.0 * Math.PI * sec / 31.0 + gi * 0.7 + level);
+            // Slow order-flow pressure: the whole book leans bid- or ask-heavy over ~50s, so
+            // the depth-imbalance signal actually swings instead of sitting at zero.
+            double skew = 0.25 * Math.sin(2.0 * Math.PI * sec / 53.0 + gi * 1.3);
+            double sideSkew = side == 0 ? 1.0 + skew : 1.0 - skew;          // side 0 = bid, 1 = ask
+            double sz = base * profile * drift * sideSkew;
+            return Math.max(1_000_000.0, Math.round(sz / 1_000_000.0) * 1_000_000.0);   // round to 1mm
         }
 
         private double halfSpread(Instrument in) {

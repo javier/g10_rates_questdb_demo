@@ -25,6 +25,15 @@ visibly move on screen during a live demo (roughly 2bp/min on the belly, a "busy
 day"). This is for show, not realism. Lower those constants for a calmer, more
 conservative tape.
 
+**Order-book depth.** Each `g10_market_data` snapshot is a coherent book, not fresh
+randomness: the number of levels and the per-level sizes are deterministic functions of
+`(instrument, second)`, so consecutive snapshots line up and the book holds its shape
+instead of flickering. Depth is characteristic per instrument (liquid futures deep, the
+belly deeper than the wings) and front-loaded (heaviest at the touch). Setting
+`--min_levels == --max_levels` pins every book to that fixed depth: backfill shallow
+(e.g. 2 levels) when only `count()`/tiering matters, then go live with `5..20` for the
+depth dashboard.
+
 ## Tables and views
 
 | Object | Type | Role |
@@ -118,6 +127,34 @@ After a run, confirm row counts with a server-side `SELECT count()` per table. T
 generator's `[DONE]` line is an internal counter, and batch errors over the WebSocket
 transport arrive asynchronously.
 
+## Dashboards
+
+Two Grafana dashboards, built and deployed by `grafana/deploy_dashboard.py` (and written
+to `grafana/g10_dashboard_live.json` / `g10_dashboard_desk.json` for manual import, in
+Grafana's portable "export for sharing" form so import prompts for the datasource):
+
+- **Live** (`g10-rates-live`, 100ms) the execution view. Every panel is `LATEST ON` /
+  `DESC LIMIT` or a materialized-view read, so it stays cheap at 100ms no matter how much
+  history exists: live yield curve, order-book depth, instrument price candles (off
+  `g10_curve_mid_1m`), curve slopes (2s10s / 5s30s), microprice, depth imbalance, and a
+  trade+hedge blotter. A single **hedge-instrument** dropdown drives the whole board:
+  depth/microprice/imbalance follow the instrument, and a chained hidden `CCY` variable
+  makes the curve and slopes follow that instrument's currency.
+- **Desk / Risk** (`g10-rates-desk`, 2s) the analytical view, defaulting to yesterday's
+  full session. Heavier queries that change on human timescales: the multi-way ASOF
+  Joint Quote + Hedge, cumulative position (trading book) DV01 by tenor bucket, and the
+  key-tenor history. A **currency** dropdown drives it; day-scale queries sample at 1m.
+
+The split is deliberate: Grafana has one refresh interval per dashboard, so the fast live
+panels (100ms) and the heavy analytical queries (which cannot tick that fast) live apart.
+
+```bash
+python3 grafana/deploy_dashboard.py                # build + push to $GRAFANA_URL
+WRITE_ONLY=1 python3 grafana/deploy_dashboard.py   # regenerate the JSON only, no deploy
+```
+
+Env: `GRAFANA_URL`, `GRAFANA_USER`, `GRAFANA_PASS`, `QDB_DS_UID`.
+
 ## Validation
 
 `sql/validation.sql` checks the dataset: volume ordering, curve shape by currency,
@@ -137,5 +174,7 @@ src/main/java/com/questdb/g10qwp/
   G10Generator.java     pools, per-second walk, DDL and views, QWP sender, backpressure
 sql/hero_query.sql      the multi-way ASOF query, with a WINDOW JOIN companion
 sql/validation.sql      the validation queries
+grafana/deploy_dashboard.py   builds + deploys the two dashboards; writes the JSON
+grafana/g10_dashboard_live.json, g10_dashboard_desk.json   importable dashboards
 run_backfill.sh, run_realtime.sh
 ```

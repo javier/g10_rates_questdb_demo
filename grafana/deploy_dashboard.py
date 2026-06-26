@@ -9,9 +9,11 @@ Usage:
     python3 grafana/deploy_dashboard.py
 Env overrides: GRAFANA_URL, GRAFANA_USER, GRAFANA_PASS, QDB_DS_UID.
 """
+import base64
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "http://localhost:3000")
@@ -32,8 +34,8 @@ def target(sql, ref="A", fmt=1):
 # level count -- the book depth can vary snapshot to snapshot and the chart follows.
 DEPTH_SQL = """WITH snap AS (
   SELECT timestamp, bids, asks FROM g10_market_data
-  WHERE $__timeFilter(timestamp) AND instrument_id = '${INSTRUMENT}'
-  ORDER BY timestamp DESC LIMIT 1
+  WHERE instrument_id = '${INSTRUMENT}'
+  LATEST ON timestamp PARTITION BY instrument_id
 ),
 bid_lvl AS (
   SELECT 'bid' AS side, p.price AS price, v.vol AS volume
@@ -136,18 +138,18 @@ return {
 CURVE_SQL = """SELECT i.ccy, i.tenor_years, c.mid AS rate
 FROM (SELECT instrument_id, mid FROM g10_core_price LATEST ON timestamp PARTITION BY instrument_id) c
 JOIN g10_instruments i ON c.instrument_id = i.instrument_id
-WHERE i.price_space = 'rate' AND i.ccy = 'USD'
+WHERE i.price_space = 'rate' AND i.ccy = '${CCY}'
 ORDER BY i.tenor_years;"""
 
 TENORS_SQL = """SELECT timestamp AS time,
-  last(CASE WHEN instrument_id = 'USD_OIS_2Y'  THEN mid END) AS "USD 2Y",
-  last(CASE WHEN instrument_id = 'USD_OIS_5Y'  THEN mid END) AS "USD 5Y",
-  last(CASE WHEN instrument_id = 'USD_OIS_10Y' THEN mid END) AS "USD 10Y",
-  last(CASE WHEN instrument_id = 'USD_OIS_30Y' THEN mid END) AS "USD 30Y"
+  last(CASE WHEN instrument_id = '${CCY}_OIS_2Y'  THEN mid END) AS "${CCY} 2Y",
+  last(CASE WHEN instrument_id = '${CCY}_OIS_5Y'  THEN mid END) AS "${CCY} 5Y",
+  last(CASE WHEN instrument_id = '${CCY}_OIS_10Y' THEN mid END) AS "${CCY} 10Y",
+  last(CASE WHEN instrument_id = '${CCY}_OIS_30Y' THEN mid END) AS "${CCY} 30Y"
 FROM g10_core_price
 WHERE $__timeFilter(timestamp)
-  AND instrument_id IN ('USD_OIS_2Y','USD_OIS_5Y','USD_OIS_10Y','USD_OIS_30Y')
-SAMPLE BY 1s;"""
+  AND instrument_id IN ('${CCY}_OIS_2Y','${CCY}_OIS_5Y','${CCY}_OIS_10Y','${CCY}_OIS_30Y')
+SAMPLE BY 1m;"""
 
 HERO_SQL = """WITH pos AS (
   SELECT timestamp, book, instrument_id, net_notional FROM g10_positions ORDER BY timestamp ASC
@@ -170,15 +172,17 @@ ORDER BY r.timestamp DESC LIMIT 20;"""
 
 # Candles read the engine-maintained 1m OHLC materialized view (g10_curve_mid_1m)
 # rather than scanning raw core_price -- faster, and it showcases the MV.
+# g10_curve_mid_1m is OHLC of core_price.mid for EVERY instrument, so it already holds
+# candles for the selected hedge instrument (e.g. ZN's price) -- no extra view needed.
 CANDLES_SQL = """SELECT timestamp AS time, open, high, low, close
 FROM g10_curve_mid_1m
-WHERE $__timeFilter(timestamp) AND instrument_id = 'USD_OIS_10Y';"""
+WHERE $__timeFilter(timestamp) AND instrument_id = '${INSTRUMENT}';"""
 
 # Cumulative book DV01 by bucket over the visible window, pivoted to one column per
 # bucket so each draws as its own line (off the g10_pos_risk MV).
 RISK_TS_SQL = """WITH f AS (
   SELECT timestamp, tenor_bucket, sum(dv01_flow) AS dv01
-  FROM g10_pos_risk WHERE $__timeFilter(timestamp) AND ccy = 'USD' SAMPLE BY 30s
+  FROM g10_pos_risk WHERE $__timeFilter(timestamp) AND ccy = '${CCY}' SAMPLE BY 1m
 ), c AS (
   SELECT timestamp, tenor_bucket,
     sum(dv01) OVER (PARTITION BY tenor_bucket ORDER BY timestamp) AS cum
@@ -189,7 +193,7 @@ SELECT timestamp AS time,
   last(CASE WHEN tenor_bucket = '3-7Y'   THEN cum END) AS "3-7Y",
   last(CASE WHEN tenor_bucket = '7-15Y'  THEN cum END) AS "7-15Y",
   last(CASE WHEN tenor_bucket = '15-30Y' THEN cum END) AS "15-30Y"
-FROM c SAMPLE BY 30s;"""
+FROM c SAMPLE BY 1m;"""
 
 TS_DEFAULTS = {"color": {"mode": "palette-classic"},
                "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 0,
@@ -237,60 +241,184 @@ def candle_panel(pid, title, sql, gp, time_from=None):
     return p
 
 
-panels = [
-    plotly_panel(1, "Live USD Yield Curve", CURVE_SQL, CURVE_SCRIPT,
-                 {"h": 8, "w": 24, "x": 0, "y": 0}),
+def stat_panel(pid, title, sql, gp, decimals=2):
+    return {"id": pid, "type": "stat", "title": title, "datasource": DS, "gridPos": gp,
+            "fieldConfig": {"defaults": {"unit": "none", "decimals": decimals,
+                            "color": {"mode": "thresholds"},
+                            "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": None}]}},
+                            "overrides": []},
+            "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
+                        "colorMode": "value", "graphMode": "none", "textMode": "value_and_name",
+                        "justifyMode": "center", "orientation": "horizontal"},
+            "targets": [target(sql)]}
+
+
+def gauge_panel(pid, title, sql, gp):
+    return {"id": pid, "type": "gauge", "title": title, "datasource": DS, "gridPos": gp,
+            "fieldConfig": {"defaults": {"min": -1, "max": 1, "unit": "none", "decimals": 3,
+                            "color": {"mode": "thresholds"},
+                            "thresholds": {"mode": "absolute", "steps": [
+                                {"color": "red", "value": None},
+                                {"color": "orange", "value": -0.4},
+                                {"color": "green", "value": -0.15},
+                                {"color": "orange", "value": 0.15},
+                                {"color": "red", "value": 0.4}]}},
+                            "overrides": []},
+            "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
+                        "showThresholdLabels": False, "showThresholdMarkers": True, "orientation": "auto"},
+            "targets": [target(sql)]}
+
+
+# --- Snappy live-board SQL: every query is LATEST ON / DESC LIMIT, so it stays cheap no
+# matter how much history exists and ticks happily at 100ms. ---
+SLOPE_SQL = """WITH m AS (
+  SELECT instrument_id, mid FROM g10_core_price
+  WHERE instrument_id IN ('${CCY}_OIS_2Y','${CCY}_OIS_5Y','${CCY}_OIS_10Y','${CCY}_OIS_30Y')
+  LATEST ON timestamp PARTITION BY instrument_id
+)
+SELECT
+  round((max(CASE WHEN instrument_id='${CCY}_OIS_10Y' THEN mid END)
+       - max(CASE WHEN instrument_id='${CCY}_OIS_2Y'  THEN mid END)) * 100, 1) AS "2s10s bp",
+  round((max(CASE WHEN instrument_id='${CCY}_OIS_30Y' THEN mid END)
+       - max(CASE WHEN instrument_id='${CCY}_OIS_5Y'  THEN mid END)) * 100, 1) AS "5s30s bp"
+FROM m;"""
+
+# Microprice only needs the top of book. best_bid / best_ask are stored as scalar
+# columns, so read those directly (no array load); the array is touched only for the
+# top-of-book size (bids[2]/asks[2] are the size rows, [..][1] is level 1).
+MICRO_SQL = """WITH snap AS (
+  SELECT best_bid, best_ask, bids[2][1] AS bid_top, asks[2][1] AS ask_top
+  FROM g10_market_data
+  WHERE instrument_id = '${INSTRUMENT}'
+  LATEST ON timestamp PARTITION BY instrument_id
+)
+SELECT round((best_bid * ask_top + best_ask * bid_top) / (bid_top + ask_top), 5) AS "Microprice",
+       round(best_ask - best_bid, 5) AS "Spread"
+FROM snap;"""
+
+# Imbalance needs every level's size on both sides -- but array_sum() does that with no
+# UNNEST and no ladder expansion, reading only the size rows (bids[2]/asks[2]).
+IMB_SQL = """SELECT round((array_sum(bids[2]) - array_sum(asks[2]))
+                        / (array_sum(bids[2]) + array_sum(asks[2])), 4) AS "Imbalance"
+FROM g10_market_data
+WHERE instrument_id = '${INSTRUMENT}'
+LATEST ON timestamp PARTITION BY instrument_id;"""
+
+BLOTTER_SQL = """SELECT timestamp AS "Time", instrument_id AS "Instrument", ccy AS "Ccy",
+  side AS "Side", notional AS "Notional", round(price, 4) AS "Price",
+  client_id AS "Client", book AS "Book"
+FROM g10_trades ORDER BY timestamp DESC LIMIT 25;"""
+
+
+# --- Live board: LATEST ON / DESC LIMIT panels + MV-backed candles -> ticks at 100ms ---
+live_panels = [
+    plotly_panel(1, "Live ${CCY} Yield Curve", CURVE_SQL, CURVE_SCRIPT,
+                 {"h": 7, "w": 24, "x": 0, "y": 0}),
     plotly_panel(2, "Market Depth - ${INSTRUMENT}", DEPTH_SQL, DEPTH_SCRIPT,
-                 {"h": 10, "w": 12, "x": 0, "y": 8}),
-    candle_panel(6, "USD 10Y swap rate (1m candles, materialized view)", CANDLES_SQL,
-                 {"h": 10, "w": 12, "x": 12, "y": 8}, time_from="1h"),
-    table_panel(3, "Joint Quote + Hedge (multi-way ASOF on dealt RFQs)", HERO_SQL,
-                {"h": 9, "w": 12, "x": 0, "y": 18}),
-    ts_panel(7, "Cumulative book DV01 by bucket - USD (over window)", RISK_TS_SQL,
-             {"h": 9, "w": 12, "x": 12, "y": 18}),
-    ts_panel(4, "USD curve - key tenors (1s)", TENORS_SQL, {"h": 7, "w": 24, "x": 0, "y": 27}),
+                 {"h": 11, "w": 12, "x": 0, "y": 7}),
+    candle_panel(6, "${INSTRUMENT} price (1m candles, materialized view)", CANDLES_SQL,
+                 {"h": 11, "w": 12, "x": 12, "y": 7}, time_from="1h"),
+    stat_panel(10, "${CCY} curve slopes (bp)", SLOPE_SQL, {"h": 5, "w": 8, "x": 0, "y": 18}, decimals=1),
+    stat_panel(11, "Microprice / spread - ${INSTRUMENT}", MICRO_SQL,
+               {"h": 5, "w": 8, "x": 8, "y": 18}, decimals=4),
+    gauge_panel(12, "Depth imbalance - ${INSTRUMENT}", IMB_SQL, {"h": 5, "w": 8, "x": 16, "y": 18}),
+    table_panel(13, "Trade + hedge blotter (latest 25)", BLOTTER_SQL, {"h": 8, "w": 24, "x": 0, "y": 23}),
 ]
 
-dashboard = {
-    "title": "G10 Rates - Realtime Demo",
-    "uid": "g10-rates-realtime",
-    "timezone": "browser",
-    "schemaVersion": 39,
-    "refresh": "250ms",
-    "time": {"from": "now-15m", "to": "now"},
-    "timepicker": {"refresh_intervals": ["250ms", "500ms", "1s", "2s", "5s", "10s", "30s", "1m", "5m", "15m", "1h"]},
-    "templating": {"list": [{
-        "name": "INSTRUMENT", "type": "query", "label": "hedge instrument",
-        "datasource": DS, "refresh": 2, "includeAll": False, "multi": False,
-        "current": {"text": "USD_ZN", "value": "USD_ZN"},
-        "query": "SELECT DISTINCT instrument_id FROM g10_instruments WHERE is_hedge = true ORDER BY instrument_id;",
-        "definition": "SELECT DISTINCT instrument_id FROM g10_instruments WHERE is_hedge = true ORDER BY instrument_id;",
-    }]},
-    "tags": ["g10", "rates", "questdb"],
-    "panels": panels,
+# --- Desk / risk board: the heavier analytical queries, slower refresh ---
+desk_panels = [
+    table_panel(20, "Joint Quote + Hedge (multi-way ASOF on dealt RFQs)", HERO_SQL,
+                {"h": 10, "w": 24, "x": 0, "y": 0}),
+    ts_panel(21, "Cumulative position (trading book) DV01 by tenor bucket - ${CCY}", RISK_TS_SQL,
+             {"h": 9, "w": 12, "x": 0, "y": 10}),
+    ts_panel(22, "${CCY} curve - key tenors (1m)", TENORS_SQL, {"h": 9, "w": 12, "x": 12, "y": 10}),
+]
+
+REFRESH_INTERVALS = ["100ms", "250ms", "500ms", "1s", "2s", "5s", "10s", "30s", "1m", "5m", "15m", "1h"]
+
+INSTRUMENT_VAR = {
+    "name": "INSTRUMENT", "type": "query", "label": "hedge instrument",
+    "datasource": DS, "refresh": 1, "includeAll": False, "multi": False,
+    "current": {"text": "USD_ZN", "value": "USD_ZN"},
+    "query": "SELECT DISTINCT instrument_id FROM g10_instruments WHERE is_hedge = true ORDER BY instrument_id;",
+    "definition": "SELECT DISTINCT instrument_id FROM g10_instruments WHERE is_hedge = true ORDER BY instrument_id;",
 }
 
-payload = {"dashboard": dashboard, "overwrite": True}
+# Live board: CCY is derived from the chosen hedge instrument (hidden), so the single
+# instrument dropdown drives the whole board -- pick EUR_FGBL and the curve, slopes and
+# tenors all follow EUR. Grafana re-evaluates it whenever INSTRUMENT changes.
+CCY_DERIVED_VAR = {
+    "name": "CCY", "type": "query", "label": "ccy", "hide": 2,
+    "datasource": DS, "refresh": 1, "includeAll": False, "multi": False,
+    "query": "SELECT ccy FROM g10_instruments WHERE instrument_id = '${INSTRUMENT}' LIMIT 1;",
+    "definition": "SELECT ccy FROM g10_instruments WHERE instrument_id = '${INSTRUMENT}' LIMIT 1;",
+}
 
-# Save the JSON to the repo for version control / manual import.
-out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "g10_dashboard.json")
-with open(out_path, "w") as fh:
-    json.dump(dashboard, fh, indent=2)
-print(f"wrote {out_path}")
+# Desk board has no order book, so it picks the currency directly.
+CCY_PICK_VAR = {
+    "name": "CCY", "type": "query", "label": "currency", "hide": 0,
+    "datasource": DS, "refresh": 1, "includeAll": False, "multi": False,
+    "current": {"text": "USD", "value": "USD"},
+    "query": "SELECT DISTINCT ccy FROM g10_instruments ORDER BY ccy;",
+    "definition": "SELECT DISTINCT ccy FROM g10_instruments ORDER BY ccy;",
+}
 
-req = urllib.request.Request(
-    f"{GRAFANA_URL}/api/dashboards/db",
-    data=json.dumps(payload).encode(),
-    headers={"Content-Type": "application/json"},
-)
-import base64
-auth = base64.b64encode(f"{GRAFANA_USER}:{GRAFANA_PASS}".encode()).decode()
-req.add_header("Authorization", f"Basic {auth}")
-try:
-    with urllib.request.urlopen(req) as resp:
-        body = json.load(resp)
-        url = f"{GRAFANA_URL}{body.get('url', '')}?refresh=250ms&from=now-15m&to=now"
-        print(f"deployed: {resp.status} {url}")
-except urllib.error.HTTPError as e:
-    print(f"ERROR {e.code}: {e.read().decode()}")
-    sys.exit(1)
+
+def make_dashboard(title, uid, refresh, time_from, panels, variables, time_to="now"):
+    return {
+        "title": title, "uid": uid, "timezone": "browser", "schemaVersion": 39,
+        "refresh": refresh, "time": {"from": time_from, "to": time_to},
+        "timepicker": {"refresh_intervals": REFRESH_INTERVALS},
+        "templating": {"list": variables},
+        "tags": ["g10", "rates", "questdb"], "panels": panels,
+    }
+
+
+live = make_dashboard("G10 Rates - Live", "g10-rates-live", "100ms", "now-15m", live_panels,
+                      [INSTRUMENT_VAR, CCY_DERIVED_VAR])
+# Desk board defaults to yesterday's full session (EOD review; also the tiering story --
+# older partitions served off cheaper storage). Day-scale, so its queries sample at 1m.
+desk = make_dashboard("G10 Rates - Desk / Risk", "g10-rates-desk", "2s", "now-1d/d", desk_panels,
+                      [CCY_PICK_VAR], time_to="now/d")
+
+
+def write_and_deploy(dash, filename, refresh):
+    # File: Grafana "export for sharing" form (a ${DS_QUESTDB} input) so a manual import
+    # on any instance prompts for its own QuestDB datasource. The API payload binds the
+    # resolved uid directly.
+    portable = {
+        "__inputs": [{
+            "name": "DS_QUESTDB", "label": "QuestDB", "description": "",
+            "type": "datasource", "pluginId": "questdb-questdb-datasource", "pluginName": "QuestDB",
+        }],
+        "__requires": [
+            {"type": "datasource", "id": "questdb-questdb-datasource", "name": "QuestDB", "version": "1.0.0"},
+            {"type": "panel", "id": "ae3e-plotly-panel", "name": "Plotly", "version": ""},
+        ],
+    }
+    portable.update(json.loads(json.dumps(dash).replace(DS_UID, "${DS_QUESTDB}")))
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    with open(out_path, "w") as fh:
+        json.dump(portable, fh, indent=2)
+    print(f"wrote {out_path}")
+    if os.environ.get("WRITE_ONLY"):
+        return
+    payload = {"dashboard": dash, "overwrite": True}
+    req = urllib.request.Request(f"{GRAFANA_URL}/api/dashboards/db",
+        data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+    auth = base64.b64encode(f"{GRAFANA_USER}:{GRAFANA_PASS}".encode()).decode()
+    req.add_header("Authorization", f"Basic {auth}")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            body = json.load(resp)
+            print(f"deployed: {resp.status} {GRAFANA_URL}{body.get('url', '')}"
+                  f"?refresh={refresh}&from={dash['time']['from']}&to={dash['time']['to']}")
+    except urllib.error.HTTPError as e:
+        print(f"ERROR {e.code}: {e.read().decode()}")
+        sys.exit(1)
+
+
+write_and_deploy(live, "g10_dashboard_live.json", "100ms")
+write_and_deploy(desk, "g10_dashboard_desk.json", "2s")
+if os.environ.get("WRITE_ONLY"):
+    print("WRITE_ONLY set; skipped deploy.")

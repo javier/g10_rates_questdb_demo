@@ -1,15 +1,40 @@
 {
-  "title": "G10 Rates - Realtime Demo",
-  "uid": "g10-rates-realtime",
+  "__inputs": [
+    {
+      "name": "DS_QUESTDB",
+      "label": "QuestDB",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "questdb-questdb-datasource",
+      "pluginName": "QuestDB"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "datasource",
+      "id": "questdb-questdb-datasource",
+      "name": "QuestDB",
+      "version": "1.0.0"
+    },
+    {
+      "type": "panel",
+      "id": "ae3e-plotly-panel",
+      "name": "Plotly",
+      "version": ""
+    }
+  ],
+  "title": "G10 Rates - Live",
+  "uid": "g10-rates-live",
   "timezone": "browser",
   "schemaVersion": 39,
-  "refresh": "250ms",
+  "refresh": "100ms",
   "time": {
     "from": "now-15m",
     "to": "now"
   },
   "timepicker": {
     "refresh_intervals": [
+      "100ms",
       "250ms",
       "500ms",
       "1s",
@@ -31,9 +56,9 @@
         "label": "hedge instrument",
         "datasource": {
           "type": "questdb-questdb-datasource",
-          "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
+          "uid": "${DS_QUESTDB}"
         },
-        "refresh": 2,
+        "refresh": 1,
         "includeAll": false,
         "multi": false,
         "current": {
@@ -42,6 +67,21 @@
         },
         "query": "SELECT DISTINCT instrument_id FROM g10_instruments WHERE is_hedge = true ORDER BY instrument_id;",
         "definition": "SELECT DISTINCT instrument_id FROM g10_instruments WHERE is_hedge = true ORDER BY instrument_id;"
+      },
+      {
+        "name": "CCY",
+        "type": "query",
+        "label": "ccy",
+        "hide": 2,
+        "datasource": {
+          "type": "questdb-questdb-datasource",
+          "uid": "${DS_QUESTDB}"
+        },
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "query": "SELECT ccy FROM g10_instruments WHERE instrument_id = '${INSTRUMENT}' LIMIT 1;",
+        "definition": "SELECT ccy FROM g10_instruments WHERE instrument_id = '${INSTRUMENT}' LIMIT 1;"
       }
     ]
   },
@@ -54,13 +94,13 @@
     {
       "id": 1,
       "type": "ae3e-plotly-panel",
-      "title": "Live USD Yield Curve",
+      "title": "Live ${CCY} Yield Curve",
       "datasource": {
         "type": "questdb-questdb-datasource",
-        "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
+        "uid": "${DS_QUESTDB}"
       },
       "gridPos": {
-        "h": 8,
+        "h": 7,
         "w": 24,
         "x": 0,
         "y": 0
@@ -74,11 +114,11 @@
         {
           "datasource": {
             "type": "questdb-questdb-datasource",
-            "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
+            "uid": "${DS_QUESTDB}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT i.ccy, i.tenor_years, c.mid AS rate\nFROM (SELECT instrument_id, mid FROM g10_core_price LATEST ON timestamp PARTITION BY instrument_id) c\nJOIN g10_instruments i ON c.instrument_id = i.instrument_id\nWHERE i.price_space = 'rate' AND i.ccy = 'USD'\nORDER BY i.tenor_years;",
+          "rawSql": "SELECT i.ccy, i.tenor_years, c.mid AS rate\nFROM (SELECT instrument_id, mid FROM g10_core_price LATEST ON timestamp PARTITION BY instrument_id) c\nJOIN g10_instruments i ON c.instrument_id = i.instrument_id\nWHERE i.price_space = 'rate' AND i.ccy = '${CCY}'\nORDER BY i.tenor_years;",
           "refId": "A",
           "selectedFormat": 2
         }
@@ -90,13 +130,13 @@
       "title": "Market Depth - ${INSTRUMENT}",
       "datasource": {
         "type": "questdb-questdb-datasource",
-        "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
+        "uid": "${DS_QUESTDB}"
       },
       "gridPos": {
-        "h": 10,
+        "h": 11,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 7
       },
       "pluginVersion": "0.5.0",
       "options": {
@@ -107,11 +147,11 @@
         {
           "datasource": {
             "type": "questdb-questdb-datasource",
-            "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
+            "uid": "${DS_QUESTDB}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "WITH snap AS (\n  SELECT timestamp, bids, asks FROM g10_market_data\n  WHERE $__timeFilter(timestamp) AND instrument_id = '${INSTRUMENT}'\n  ORDER BY timestamp DESC LIMIT 1\n),\nbid_lvl AS (\n  SELECT 'bid' AS side, p.price AS price, v.vol AS volume\n  FROM snap, UNNEST(snap.bids[1]) WITH ORDINALITY p(price, lvl),\n             UNNEST(snap.bids[2]) WITH ORDINALITY v(vol, vlvl)\n  WHERE p.lvl = v.vlvl\n),\nask_lvl AS (\n  SELECT 'ask' AS side, p.price AS price, v.vol AS volume\n  FROM snap, UNNEST(snap.asks[1]) WITH ORDINALITY p(price, lvl),\n             UNNEST(snap.asks[2]) WITH ORDINALITY v(vol, vlvl)\n  WHERE p.lvl = v.vlvl\n),\nbid_cum AS (SELECT side, price, volume, SUM(volume) OVER (ORDER BY price DESC) AS cum_volume FROM bid_lvl),\nask_cum AS (SELECT side, price, volume, SUM(volume) OVER (ORDER BY price ASC) AS cum_volume FROM ask_lvl)\nSELECT * FROM bid_cum UNION ALL SELECT * FROM ask_cum ORDER BY side, price;",
+          "rawSql": "WITH snap AS (\n  SELECT timestamp, bids, asks FROM g10_market_data\n  WHERE instrument_id = '${INSTRUMENT}'\n  LATEST ON timestamp PARTITION BY instrument_id\n),\nbid_lvl AS (\n  SELECT 'bid' AS side, p.price AS price, v.vol AS volume\n  FROM snap, UNNEST(snap.bids[1]) WITH ORDINALITY p(price, lvl),\n             UNNEST(snap.bids[2]) WITH ORDINALITY v(vol, vlvl)\n  WHERE p.lvl = v.vlvl\n),\nask_lvl AS (\n  SELECT 'ask' AS side, p.price AS price, v.vol AS volume\n  FROM snap, UNNEST(snap.asks[1]) WITH ORDINALITY p(price, lvl),\n             UNNEST(snap.asks[2]) WITH ORDINALITY v(vol, vlvl)\n  WHERE p.lvl = v.vlvl\n),\nbid_cum AS (SELECT side, price, volume, SUM(volume) OVER (ORDER BY price DESC) AS cum_volume FROM bid_lvl),\nask_cum AS (SELECT side, price, volume, SUM(volume) OVER (ORDER BY price ASC) AS cum_volume FROM ask_lvl)\nSELECT * FROM bid_cum UNION ALL SELECT * FROM ask_cum ORDER BY side, price;",
           "refId": "A",
           "selectedFormat": 2
         }
@@ -120,16 +160,16 @@
     {
       "id": 6,
       "type": "candlestick",
-      "title": "USD 10Y swap rate (1m candles, materialized view)",
+      "title": "${INSTRUMENT} price (1m candles, materialized view)",
       "datasource": {
         "type": "questdb-questdb-datasource",
-        "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
+        "uid": "${DS_QUESTDB}"
       },
       "gridPos": {
-        "h": 10,
+        "h": 11,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 7
       },
       "fieldConfig": {
         "defaults": {
@@ -161,11 +201,11 @@
         {
           "datasource": {
             "type": "questdb-questdb-datasource",
-            "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
+            "uid": "${DS_QUESTDB}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT timestamp AS time, open, high, low, close\nFROM g10_curve_mid_1m\nWHERE $__timeFilter(timestamp) AND instrument_id = 'USD_OIS_10Y';",
+          "rawSql": "SELECT timestamp AS time, open, high, low, close\nFROM g10_curve_mid_1m\nWHERE $__timeFilter(timestamp) AND instrument_id = '${INSTRUMENT}';",
           "refId": "A",
           "selectedFormat": 2
         }
@@ -174,18 +214,217 @@
       "hideTimeOverride": true
     },
     {
-      "id": 3,
-      "type": "table",
-      "title": "Joint Quote + Hedge (multi-way ASOF on dealt RFQs)",
+      "id": 10,
+      "type": "stat",
+      "title": "${CCY} curve slopes (bp)",
       "datasource": {
         "type": "questdb-questdb-datasource",
-        "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
+        "uid": "${DS_QUESTDB}"
       },
       "gridPos": {
-        "h": 9,
-        "w": 12,
+        "h": 5,
+        "w": 8,
         "x": 0,
         "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 1,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "orientation": "horizontal"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "WITH m AS (\n  SELECT instrument_id, mid FROM g10_core_price\n  WHERE instrument_id IN ('${CCY}_OIS_2Y','${CCY}_OIS_5Y','${CCY}_OIS_10Y','${CCY}_OIS_30Y')\n  LATEST ON timestamp PARTITION BY instrument_id\n)\nSELECT\n  round((max(CASE WHEN instrument_id='${CCY}_OIS_10Y' THEN mid END)\n       - max(CASE WHEN instrument_id='${CCY}_OIS_2Y'  THEN mid END)) * 100, 1) AS \"2s10s bp\",\n  round((max(CASE WHEN instrument_id='${CCY}_OIS_30Y' THEN mid END)\n       - max(CASE WHEN instrument_id='${CCY}_OIS_5Y'  THEN mid END)) * 100, 1) AS \"5s30s bp\"\nFROM m;",
+          "refId": "A",
+          "selectedFormat": 2
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Microprice / spread - ${INSTRUMENT}",
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "${DS_QUESTDB}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 8,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 4,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "orientation": "horizontal"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "WITH snap AS (\n  SELECT best_bid, best_ask, bids[2][1] AS bid_top, asks[2][1] AS ask_top\n  FROM g10_market_data\n  WHERE instrument_id = '${INSTRUMENT}'\n  LATEST ON timestamp PARTITION BY instrument_id\n)\nSELECT round((best_bid * ask_top + best_ask * bid_top) / (bid_top + ask_top), 5) AS \"Microprice\",\n       round(best_ask - best_bid, 5) AS \"Spread\"\nFROM snap;",
+          "refId": "A",
+          "selectedFormat": 2
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "gauge",
+      "title": "Depth imbalance - ${INSTRUMENT}",
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "${DS_QUESTDB}"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 18
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": -1,
+          "max": 1,
+          "unit": "none",
+          "decimals": 3,
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": -0.4
+              },
+              {
+                "color": "green",
+                "value": -0.15
+              },
+              {
+                "color": "orange",
+                "value": 0.15
+              },
+              {
+                "color": "red",
+                "value": 0.4
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "questdb-questdb-datasource",
+            "uid": "${DS_QUESTDB}"
+          },
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "SELECT round((array_sum(bids[2]) - array_sum(asks[2]))\n                        / (array_sum(bids[2]) + array_sum(asks[2])), 4) AS \"Imbalance\"\nFROM g10_market_data\nWHERE instrument_id = '${INSTRUMENT}'\nLATEST ON timestamp PARTITION BY instrument_id;",
+          "refId": "A",
+          "selectedFormat": 2
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "table",
+      "title": "Trade + hedge blotter (latest 25)",
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "${DS_QUESTDB}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 23
       },
       "options": {
         "showHeader": true,
@@ -207,121 +446,11 @@
         {
           "datasource": {
             "type": "questdb-questdb-datasource",
-            "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
+            "uid": "${DS_QUESTDB}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "WITH pos AS (\n  SELECT timestamp, book, instrument_id, net_notional FROM g10_positions ORDER BY timestamp ASC\n)\nSELECT r.timestamp AS \"Time\", r.instrument_id AS \"Instrument\", r.ccy AS \"Ccy\",\n  r.side AS \"Client\", r.notional AS \"Notional\",\n  round(m.mid, 4) AS \"Curve mid\", p.net_notional AS \"Position\",\n  round(p.net_notional * i.dv01_per_unit, 0) AS \"Bucket DV01\",\n  round(m.mid + (-p.net_notional / 5.0e8) * 0.0001, 5) AS \"Quoted mid\",\n  round(-(p.net_notional * i.dv01_per_unit) / NULLIF(h.dv01_per_unit, 0), 0) AS \"Implied hedge\"\nFROM g10_rfqs r\nASOF JOIN g10_core_price m ON (r.instrument_id = m.instrument_id)\nASOF JOIN pos p ON (r.instrument_id = p.instrument_id)\nJOIN g10_instruments i ON r.instrument_id = i.instrument_id\nLEFT JOIN g10_instruments h ON h.instrument_id = (\n  CASE i.ccy WHEN 'USD' THEN 'USD_ZN' WHEN 'EUR' THEN 'EUR_FGBL'\n             WHEN 'GBP' THEN 'GBP_GLONG' ELSE 'JPY_JGBL' END)\nWHERE $__timeFilter(r.timestamp) AND r.status = 'dealt' AND p.net_notional IS NOT NULL\nORDER BY r.timestamp DESC LIMIT 20;",
-          "refId": "A",
-          "selectedFormat": 2
-        }
-      ]
-    },
-    {
-      "id": 7,
-      "type": "timeseries",
-      "title": "Cumulative book DV01 by bucket - USD (over window)",
-      "datasource": {
-        "type": "questdb-questdb-datasource",
-        "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
-      },
-      "gridPos": {
-        "h": 9,
-        "w": 12,
-        "x": 12,
-        "y": 18
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true,
-            "axisPlacement": "auto"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "questdb-questdb-datasource",
-            "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
-          },
-          "format": 1,
-          "queryType": "sql",
-          "rawSql": "WITH f AS (\n  SELECT timestamp, tenor_bucket, sum(dv01_flow) AS dv01\n  FROM g10_pos_risk WHERE $__timeFilter(timestamp) AND ccy = 'USD' SAMPLE BY 30s\n), c AS (\n  SELECT timestamp, tenor_bucket,\n    sum(dv01) OVER (PARTITION BY tenor_bucket ORDER BY timestamp) AS cum\n  FROM f\n)\nSELECT timestamp AS time,\n  last(CASE WHEN tenor_bucket = '1-3Y'   THEN cum END) AS \"1-3Y\",\n  last(CASE WHEN tenor_bucket = '3-7Y'   THEN cum END) AS \"3-7Y\",\n  last(CASE WHEN tenor_bucket = '7-15Y'  THEN cum END) AS \"7-15Y\",\n  last(CASE WHEN tenor_bucket = '15-30Y' THEN cum END) AS \"15-30Y\"\nFROM c SAMPLE BY 30s;",
-          "refId": "A",
-          "selectedFormat": 2
-        }
-      ]
-    },
-    {
-      "id": 4,
-      "type": "timeseries",
-      "title": "USD curve - key tenors (1s)",
-      "datasource": {
-        "type": "questdb-questdb-datasource",
-        "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 24,
-        "x": 0,
-        "y": 27
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 2,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true,
-            "axisPlacement": "auto"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "questdb-questdb-datasource",
-            "uid": "adf6db91-a92a-4a5a-b814-93c8c5aa4240"
-          },
-          "format": 1,
-          "queryType": "sql",
-          "rawSql": "SELECT timestamp AS time,\n  last(CASE WHEN instrument_id = 'USD_OIS_2Y'  THEN mid END) AS \"USD 2Y\",\n  last(CASE WHEN instrument_id = 'USD_OIS_5Y'  THEN mid END) AS \"USD 5Y\",\n  last(CASE WHEN instrument_id = 'USD_OIS_10Y' THEN mid END) AS \"USD 10Y\",\n  last(CASE WHEN instrument_id = 'USD_OIS_30Y' THEN mid END) AS \"USD 30Y\"\nFROM g10_core_price\nWHERE $__timeFilter(timestamp)\n  AND instrument_id IN ('USD_OIS_2Y','USD_OIS_5Y','USD_OIS_10Y','USD_OIS_30Y')\nSAMPLE BY 1s;",
+          "rawSql": "SELECT timestamp AS \"Time\", instrument_id AS \"Instrument\", ccy AS \"Ccy\",\n  side AS \"Side\", notional AS \"Notional\", round(price, 4) AS \"Price\",\n  client_id AS \"Client\", book AS \"Book\"\nFROM g10_trades ORDER BY timestamp DESC LIMIT 25;",
           "refId": "A",
           "selectedFormat": 2
         }
