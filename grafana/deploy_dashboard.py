@@ -317,7 +317,7 @@ live_panels = [
     plotly_panel(2, "Market Depth - ${INSTRUMENT}", DEPTH_SQL, DEPTH_SCRIPT,
                  {"h": 11, "w": 12, "x": 0, "y": 7}),
     candle_panel(6, "${INSTRUMENT} price (1m candles, materialized view)", CANDLES_SQL,
-                 {"h": 11, "w": 12, "x": 12, "y": 7}, time_from="1h"),
+                 {"h": 11, "w": 12, "x": 12, "y": 7}),
     stat_panel(10, "${CCY} curve slopes (bp)", SLOPE_SQL, {"h": 5, "w": 8, "x": 0, "y": 18}, decimals=1),
     stat_panel(11, "Microprice / spread - ${INSTRUMENT}", MICRO_SQL,
                {"h": 5, "w": 8, "x": 8, "y": 18}, decimals=4),
@@ -378,8 +378,12 @@ live = make_dashboard("G10 Rates - Live", "g10-rates-live", "100ms", "now-15m", 
                       [INSTRUMENT_VAR, CCY_DERIVED_VAR])
 # Desk board defaults to yesterday's full session (EOD review; also the tiering story --
 # older partitions served off cheaper storage). Day-scale, so its queries sample at 1m.
-desk = make_dashboard("G10 Rates - Desk / Risk", "g10-rates-desk", "2s", "now-1d/d", desk_panels,
-                      [CCY_PICK_VAR], time_to="now/d")
+# Desk board reviews yesterday's static session, so auto-refresh is off (refresh="") --
+# no point re-running the heavy hero query on a timer. Grafana's "Yesterday" range is the
+# SAME expression on both ends: from rounds to the start of yesterday, to rounds to the
+# end of yesterday. (now/d as a `to` is end-of-TODAY.)
+desk = make_dashboard("G10 Rates - Desk / Risk", "g10-rates-desk", "", "now-1d/d", desk_panels,
+                      [CCY_PICK_VAR], time_to="now-1d/d")
 
 
 def write_and_deploy(dash, filename, refresh):

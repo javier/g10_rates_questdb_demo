@@ -27,10 +27,10 @@
   "uid": "g10-rates-desk",
   "timezone": "browser",
   "schemaVersion": 39,
-  "refresh": "2s",
+  "refresh": "",
   "time": {
     "from": "now-1d/d",
-    "to": "now/d"
+    "to": "now-1d/d"
   },
   "timepicker": {
     "refresh_intervals": [

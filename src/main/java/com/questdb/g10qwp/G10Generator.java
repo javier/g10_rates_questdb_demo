@@ -1106,7 +1106,7 @@ public final class G10Generator {
                     + "SELECT t.timestamp, t.book, i.ccy, i.tenor_bucket, "
                     + "sum((CASE WHEN t.side='buy' THEN 1 ELSE -1 END) * t.notional * i.dv01_per_unit) AS dv01_flow "
                     + "FROM " + trades + " t JOIN " + instr + " i ON t.instrument_id = i.instrument_id "
-                    + "SAMPLE BY 1s) PARTITION BY HOUR" + mvRetentionClause("3 DAYS"));
+                    + "SAMPLE BY 1s) PARTITION BY HOUR" + mvRetentionClause("10 DAYS"));
         }
 
         // Curve-mid candles (IMMEDIATE off the low-volume core_price table).
@@ -1115,7 +1115,7 @@ public final class G10Generator {
                     + cfg.suffix + "' WITH BASE '" + core + "' REFRESH IMMEDIATE AS ("
                     + "SELECT timestamp, instrument_id, first(mid) AS open, max(mid) AS high, "
                     + "min(mid) AS low, last(mid) AS close FROM " + core + " SAMPLE BY 1m"
-                    + ") PARTITION BY HOUR" + mvRetentionClause("3 DAYS"));
+                    + ") PARTITION BY HOUR" + mvRetentionClause("10 DAYS"));
         }
 
         // BBO rollup over the depth feed — TIMER refresh, never IMMEDIATE (§13.6).
@@ -1124,7 +1124,7 @@ public final class G10Generator {
             execDdl("g10_bbo_1m" + cfg.suffix, "CREATE MATERIALIZED VIEW IF NOT EXISTS 'g10_bbo_1m" + cfg.suffix
                     + "' WITH BASE '" + md + "' REFRESH EVERY 1m AS ("
                     + "SELECT timestamp, instrument_id, max(best_bid) AS bid, min(best_ask) AS ask "
-                    + "FROM " + md + " SAMPLE BY 1m) PARTITION BY DAY" + mvRetentionClause("3 DAYS"));
+                    + "FROM " + md + " SAMPLE BY 1m) PARTITION BY DAY" + mvRetentionClause("10 DAYS"));
         }
     }
 

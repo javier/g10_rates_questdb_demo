@@ -140,13 +140,20 @@ Grafana's portable "export for sharing" form so import prompts for the datasourc
   trade+hedge blotter. A single **hedge-instrument** dropdown drives the whole board:
   depth/microprice/imbalance follow the instrument, and a chained hidden `CCY` variable
   makes the curve and slopes follow that instrument's currency.
-- **Desk / Risk** (`g10-rates-desk`, 2s) the analytical view, defaulting to yesterday's
-  full session. Heavier queries that change on human timescales: the multi-way ASOF
-  Joint Quote + Hedge, cumulative position (trading book) DV01 by tenor bucket, and the
-  key-tenor history. A **currency** dropdown drives it; day-scale queries sample at 1m.
+- **Desk / Risk** (`g10-rates-desk`, auto-refresh off) the analytical view, defaulting to
+  yesterday's full session (static history, so no point re-running the heavy queries on a
+  timer). The multi-way ASOF Joint Quote + Hedge, cumulative position (trading book) DV01
+  by tenor bucket, and the key-tenor history. A **currency** dropdown drives it; day-scale
+  queries sample at 1m.
 
 The split is deliberate: Grafana has one refresh interval per dashboard, so the fast live
 panels (100ms) and the heavy analytical queries (which cannot tick that fast) live apart.
+
+The matview-backed panels (desk DV01, live candles) read views with a 10-day TTL, so the
+desk board reaches back about ten days. To change that, edit the TTL in the generator and
+rerun `sql/recreate_matviews.sql` against an existing instance: `CREATE MATERIALIZED VIEW
+IF NOT EXISTS` will not alter a live view, so the matviews must be dropped and recreated
+(recreating triggers a full refresh over the base history).
 
 ```bash
 python3 grafana/deploy_dashboard.py                # build + push to $GRAFANA_URL
@@ -174,6 +181,7 @@ src/main/java/com/questdb/g10qwp/
   G10Generator.java     pools, per-second walk, DDL and views, QWP sender, backpressure
 sql/hero_query.sql      the multi-way ASOF query, with a WINDOW JOIN companion
 sql/validation.sql      the validation queries
+sql/recreate_matviews.sql   drop + recreate the matviews (e.g. to change their TTL)
 grafana/deploy_dashboard.py   builds + deploys the two dashboards; writes the JSON
 grafana/g10_dashboard_live.json, g10_dashboard_desk.json   importable dashboards
 run_backfill.sh, run_realtime.sh
