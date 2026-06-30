@@ -420,9 +420,9 @@ public final class G10Generator {
         }
 
         private void emitSnapshot(Sender sender, long ts, int gi, Instrument in, double mid) {
-            long sec = ts / NANOS_PER_SEC;
-            int levels = bookLevels(in, gi, sec);
-            double half = halfSpread(in);
+            double t = (double) ts / NANOS_PER_SEC;   // fractional seconds: the book breathes continuously
+            int levels = bookLevels(in, gi, t);
+            double half = halfSpread(in, t);
             double bestBid = G10Universe.quantizeToTick(mid - half, in.tickSize);
             double bestAsk = G10Universe.quantizeToTick(mid + half, in.tickSize);
             DoubleArray bids = bidArrays.computeIfAbsent(levels, L -> new DoubleArray(2, L));
@@ -436,10 +436,10 @@ public final class G10Generator {
                 asks.append(G10Universe.quantizeToTick(bestAsk + i * in.tickSize, in.tickSize));
             }
             for (int i = 0; i < levels; i++) {
-                bids.append(levelSize(in, gi, i, sec, 0));
+                bids.append(levelSize(in, gi, i, t, 0));
             }
             for (int i = 0; i < levels; i++) {
-                asks.append(levelSize(in, gi, i, sec, 1));
+                asks.append(levelSize(in, gi, i, t, 1));
             }
             sender.table(cfg.marketDataTable())
                     .symbol("instrument_id", in.id)
@@ -470,7 +470,7 @@ public final class G10Generator {
                 Instrument in = instruments.get(owned[ThreadLocalRandom.current().nextInt(owned.length)]);
                 double[] betas = curve.betasAt(in.ccyIndex, (double) off / NANOS_PER_SEC);
                 double mid = priceQuantized(in, betas);
-                double half = halfSpread(in);
+                double half = halfSpread(in, (double) ts / NANOS_PER_SEC);
                 double bid = roundIf(in, mid - half);
                 double ask = roundIf(in, mid + half);
                 long sz = G10Universe.volumeForLevel(0, ladder);
@@ -505,9 +505,9 @@ public final class G10Generator {
                 lastQuotedMid[gi] = mid;
                 lastQuoteSec[gi] = k;
                 double skewBps = inventorySkewBps(gi);
-                double half = halfSpread(in);
                 long off = Math.min(NANOS_PER_SEC - 1, (long) slot++ * 137L);  // ascending within the second
                 long ts = secondStartNs + off + tsLookaheadNs;
+                double half = halfSpread(in, (double) ts / NANOS_PER_SEC);
                 if (endNs != null && ts >= endNs) {
                     return;
                 }
@@ -573,7 +573,7 @@ public final class G10Generator {
                 // distinguishes it from the streaming firehose (null rfq_id, §5.1).
                 double[] qBetas = curve.betasAt(in.ccyIndex, (double) off / NANOS_PER_SEC);
                 double qMid = priceQuantized(in, qBetas);
-                double qHalf = halfSpread(in);
+                double qHalf = halfSpread(in, (double) ts / NANOS_PER_SEC);
                 double qSkewBps = inventorySkewBps(gi);
                 double qSkewPx = skewInPriceUnits(in, qSkewBps);
                 sender.table(cfg.quotesTable())
@@ -594,7 +594,7 @@ public final class G10Generator {
                 if (deals) {
                     double[] betas = curve.betasAt(in.ccyIndex, (double) off / NANOS_PER_SEC);
                     double mid = priceQuantized(in, betas);
-                    double half = halfSpread(in);
+                    double half = halfSpread(in, (double) ts / NANOS_PER_SEC);
                     // Client lifts our offer / hits our bid; we take the opposite sign.
                     double dealPx = roundIf(in, clientBuy ? mid + half : mid - half);
                     double signedClient = clientBuy ? -notional : notional;  // our position vs client
@@ -612,7 +612,7 @@ public final class G10Generator {
                         Instrument fut = instruments.get(hf);
                         double[] fb = curve.betasAt(fut.ccyIndex, (double) off / NANOS_PER_SEC);
                         double futMid = priceQuantized(fut, fb);
-                        double fHalf = halfSpread(fut);
+                        double fHalf = halfSpread(fut, (double) ts / NANOS_PER_SEC);
                         boolean hedgeBuy = signedClient < 0;  // short risk -> buy futures to flatten
                         double best = hedgeBuy
                                 ? G10Universe.quantizeToTick(futMid + fHalf, fut.tickSize)
@@ -728,14 +728,17 @@ public final class G10Generator {
         // sweep 5<->20 on a clean cycle. Setting --min_levels == --max_levels pins every
         // book to that fixed depth (e.g. 2 for a shallow count/tiering backfill, then go
         // live with 5..20 for the depth dashboard).
-        private int bookLevels(Instrument in, int gi, long sec) {
+        // t is fractional seconds. The level count evolves on slow periods (41s, 97s) only,
+        // so the ladder shape stays stable and an occasional level appears/disappears -- the
+        // per-level SIZE is what breathes fast (see levelSize), which is the realistic split.
+        private int bookLevels(Instrument in, int gi, double t) {
             int span = cfg.maxLevels - cfg.minLevels;
             if (span <= 0) {
                 return cfg.minLevels;   // override: fixed depth (shallow backfill / forced depth)
             }
             double base = cfg.minLevels + liquidity(in) * span;   // liquid instruments sit deep
-            double jitter = 0.12 * span * (Math.sin(2.0 * Math.PI * sec / 41.0 + gi)
-                                         + 0.5 * Math.sin(2.0 * Math.PI * sec / 97.0 + gi * 2.0));
+            double jitter = 0.12 * span * (Math.sin(2.0 * Math.PI * t / 41.0 + gi)
+                                         + 0.5 * Math.sin(2.0 * Math.PI * t / 97.0 + gi * 2.0));
             int n = (int) Math.round(base + jitter);
             return Math.max(cfg.minLevels, Math.min(cfg.maxLevels, n));
         }
@@ -748,23 +751,37 @@ public final class G10Generator {
             return Math.max(0.15, Math.min(1.0, base * belly));
         }
 
-        private double levelSize(Instrument in, int gi, int level, long sec, int side) {
+        // t is fractional seconds, so the size is a continuous function of time: sampled at
+        // the ~20+ snapshots/sec we already emit per instrument, the ladder visibly breathes
+        // sub-second instead of holding flat for a whole second.
+        private double levelSize(Instrument in, int gi, int level, double t, int side) {
             double base = in.isRate() ? 45_000_000.0 : 20_000_000.0;        // top-of-book clip, by product
             double profile = 1.0 / (1.0 + 0.22 * level);                    // thins into the book
-            double drift = 1.0 + 0.10 * Math.sin(2.0 * Math.PI * sec / 31.0 + gi * 0.7 + level);
+            // Slow breathing (~31s) plus a faster ripple (~2.7s) so the bars move between
+            // sub-second snapshots while staying smooth and coherent (no flicker).
+            double drift = 1.0 + 0.10 * Math.sin(2.0 * Math.PI * t / 31.0 + gi * 0.7 + level)
+                               + 0.05 * Math.sin(2.0 * Math.PI * t / 2.7 + gi + level * 0.5);
             // Slow order-flow pressure: the whole book leans bid- or ask-heavy over ~50s, so
-            // the depth-imbalance signal actually swings instead of sitting at zero.
-            double skew = 0.25 * Math.sin(2.0 * Math.PI * sec / 53.0 + gi * 1.3);
+            // the depth-imbalance signal actually swings instead of sitting at zero. (The fast
+            // ripple is side-symmetric and cancels in the imbalance, keeping that signal clean.)
+            double skew = 0.25 * Math.sin(2.0 * Math.PI * t / 53.0 + gi * 1.3);
             double sideSkew = side == 0 ? 1.0 + skew : 1.0 - skew;          // side 0 = bid, 1 = ask
             double sz = base * profile * drift * sideSkew;
             return Math.max(1_000_000.0, Math.round(sz / 1_000_000.0) * 1_000_000.0);   // round to 1mm
         }
 
-        private double halfSpread(Instrument in) {
-            if (in.isRate()) {
-                return (0.05 + 0.01 * in.tenorYears) * 0.01;   // 0.05bp..~0.35bp, in %
-            }
-            return in.tickSize * (0.5 + in.tenorYears / 30.0);
+        // Spreads breathe with liquidity: a slow ~37s cycle plus a small fast ripple, floored
+        // so the touch never crosses (the multiplier stays in ~[0.8, 2.0]). t is fractional
+        // seconds; a per-instrument phase keeps instruments out of lockstep. Without this the
+        // spread is a constant pinned at ~1 tick and the live spread stat looks dead.
+        private double halfSpread(Instrument in, double t) {
+            double phase = in.ccyIndex * 1.3 + in.tenorYears * 0.11;
+            double breath = 1.4 + 0.5 * Math.sin(2.0 * Math.PI * t / 37.0 + phase)
+                                + 0.1 * Math.sin(2.0 * Math.PI * t / 3.1 + phase * 2.0);
+            double baseHalf = in.isRate()
+                    ? (0.05 + 0.01 * in.tenorYears) * 0.01   // 0.05bp..~0.35bp, in %
+                    : in.tickSize * (0.5 + in.tenorYears / 30.0);
+            return baseHalf * breath;
         }
 
         private int nearestFuture(int ccyIndex, double tenorYears) {

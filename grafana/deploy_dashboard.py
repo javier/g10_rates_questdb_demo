@@ -34,7 +34,7 @@ def target(sql, ref="A", fmt=1):
 # level count -- the book depth can vary snapshot to snapshot and the chart follows.
 DEPTH_SQL = """WITH snap AS (
   SELECT timestamp, bids, asks FROM g10_market_data
-  WHERE instrument_id = '${INSTRUMENT}'
+  WHERE instrument_id = '${INSTRUMENT}' AND timestamp <= now()
   LATEST ON timestamp PARTITION BY instrument_id
 ),
 bid_lvl AS (
@@ -140,10 +140,24 @@ return {
 };
 """
 
-# All four G10 curves overlaid (no currency filter) -- this is the market-overview
-# panel, so breadth beats focus; the per-instrument currency still drives slopes/tenors.
+# Live board: a single currency (follows the chained CCY var, so the instrument dropdown
+# drives it). One curve auto-scales the y-axis to ~100-120bp instead of the ~450bp needed for
+# all four, so the realistic ~2bp/min walk is actually visible as drift/reshape; now() sweeps
+# the lookahead buffer so it advances every refresh.
 CURVE_SQL = """SELECT i.ccy, i.tenor_years, c.mid AS rate
-FROM (SELECT instrument_id, mid FROM g10_core_price LATEST ON timestamp PARTITION BY instrument_id) c
+FROM (SELECT instrument_id, mid FROM g10_core_price WHERE timestamp <= now()
+      LATEST ON timestamp PARTITION BY instrument_id) c
+JOIN g10_instruments i ON c.instrument_id = i.instrument_id
+WHERE i.price_space = 'rate' AND i.ccy = '${CCY}'
+ORDER BY i.tenor_years;"""
+
+# Desk board: all four G10 curves overlaid as a static overview, bounded to the SELECTED
+# window via $__timeFilter + LATEST ON -- i.e. the curve as of the end of the range
+# (yesterday's close for the default; the current curve for trailing 2d/7d ranges). On the
+# tall four-currency axis the stillness is appropriate for an EOD review board.
+CURVE_DESK_SQL = """SELECT i.ccy, i.tenor_years, c.mid AS rate
+FROM (SELECT instrument_id, mid FROM g10_core_price WHERE $__timeFilter(timestamp)
+      LATEST ON timestamp PARTITION BY instrument_id) c
 JOIN g10_instruments i ON c.instrument_id = i.instrument_id
 WHERE i.price_space = 'rate'
 ORDER BY i.ccy, i.tenor_years;"""
@@ -277,10 +291,15 @@ def gauge_panel(pid, title, sql, gp):
 
 
 # --- Snappy live-board SQL: every query is LATEST ON / DESC LIMIT, so it stays cheap no
-# matter how much history exists and ticks happily at 100ms. ---
+# matter how much history exists and ticks happily at 100ms. The LATEST ON snapshots add
+# `timestamp <= now()`: the generator stamps rows ~2s ahead (realtime_lookahead), so the
+# buffer holds the next couple of seconds of sub-second snapshots. Bounding to now() makes
+# the 100ms board SWEEP that buffer (latest row <= wall-clock, advancing each refresh)
+# instead of snapping to the future edge, which would only move once per flush (~1/s). ---
 SLOPE_SQL = """WITH m AS (
   SELECT instrument_id, mid FROM g10_core_price
   WHERE instrument_id IN ('${CCY}_OIS_2Y','${CCY}_OIS_5Y','${CCY}_OIS_10Y','${CCY}_OIS_30Y')
+    AND timestamp <= now()
   LATEST ON timestamp PARTITION BY instrument_id
 )
 SELECT
@@ -296,7 +315,7 @@ FROM m;"""
 MICRO_SQL = """WITH snap AS (
   SELECT best_bid, best_ask, bids[2][1] AS bid_top, asks[2][1] AS ask_top
   FROM g10_market_data
-  WHERE instrument_id = '${INSTRUMENT}'
+  WHERE instrument_id = '${INSTRUMENT}' AND timestamp <= now()
   LATEST ON timestamp PARTITION BY instrument_id
 )
 SELECT round((best_bid * ask_top + best_ask * bid_top) / (bid_top + ask_top), 5) AS "Microprice",
@@ -308,7 +327,7 @@ FROM snap;"""
 IMB_SQL = """SELECT round((array_sum(bids[2]) - array_sum(asks[2]))
                         / (array_sum(bids[2]) + array_sum(asks[2])), 4) AS "Imbalance"
 FROM g10_market_data
-WHERE instrument_id = '${INSTRUMENT}'
+WHERE instrument_id = '${INSTRUMENT}' AND timestamp <= now()
 LATEST ON timestamp PARTITION BY instrument_id;"""
 
 BLOTTER_SQL = """SELECT timestamp AS "Time", instrument_id AS "Instrument", ccy AS "Ccy",
@@ -319,7 +338,7 @@ FROM g10_trades ORDER BY timestamp DESC LIMIT 25;"""
 
 # --- Live board: LATEST ON / DESC LIMIT panels + MV-backed candles -> ticks at 100ms ---
 live_panels = [
-    plotly_panel(1, "Live G10 Yield Curves", CURVE_SQL, CURVE_SCRIPT,
+    plotly_panel(1, "Live ${CCY} Yield Curve", CURVE_SQL, CURVE_SCRIPT,
                  {"h": 7, "w": 24, "x": 0, "y": 0}),
     plotly_panel(2, "Market Depth - ${INSTRUMENT}", DEPTH_SQL, DEPTH_SCRIPT,
                  {"h": 11, "w": 12, "x": 0, "y": 7}),
@@ -332,13 +351,17 @@ live_panels = [
     table_panel(13, "Trade + hedge blotter (latest 25)", BLOTTER_SQL, {"h": 8, "w": 24, "x": 0, "y": 23}),
 ]
 
-# --- Desk / risk board: the heavier analytical queries, slower refresh ---
+# --- Desk / risk board: the heavier analytical queries, slower refresh. Leads with the
+# four-currency curve overview (as of the end of the selected window), then the hero
+# quote+hedge join, then the time-series risk panels. ---
 desk_panels = [
+    plotly_panel(19, "G10 Yield Curves (as of end of range)", CURVE_DESK_SQL, CURVE_SCRIPT,
+                 {"h": 8, "w": 24, "x": 0, "y": 0}),
     table_panel(20, "Joint Quote + Hedge (multi-way ASOF on dealt RFQs)", HERO_SQL,
-                {"h": 10, "w": 24, "x": 0, "y": 0}),
+                {"h": 10, "w": 24, "x": 0, "y": 8}),
     ts_panel(21, "Cumulative position (trading book) DV01 by tenor bucket - ${CCY}", RISK_TS_SQL,
-             {"h": 9, "w": 12, "x": 0, "y": 10}),
-    ts_panel(22, "${CCY} curve - key tenors (1m)", TENORS_SQL, {"h": 9, "w": 12, "x": 12, "y": 10}),
+             {"h": 9, "w": 12, "x": 0, "y": 18}),
+    ts_panel(22, "${CCY} curve - key tenors (1m)", TENORS_SQL, {"h": 9, "w": 12, "x": 12, "y": 18}),
 ]
 
 REFRESH_INTERVALS = ["100ms", "250ms", "500ms", "1s", "2s", "5s", "10s", "30s", "1m", "5m", "15m", "1h"]
@@ -346,15 +369,14 @@ REFRESH_INTERVALS = ["100ms", "250ms", "500ms", "1s", "2s", "5s", "10s", "30s", 
 INSTRUMENT_VAR = {
     "name": "INSTRUMENT", "type": "query", "label": "hedge instrument",
     "datasource": DS, "refresh": 1, "includeAll": False, "multi": False,
-    "current": {"text": "USD_ZN", "value": "USD_ZN"},
+    "current": {"text": "GBP_GLONG", "value": "GBP_GLONG"},
     "query": "SELECT DISTINCT instrument_id FROM g10_instruments WHERE is_hedge = true ORDER BY instrument_id;",
     "definition": "SELECT DISTINCT instrument_id FROM g10_instruments WHERE is_hedge = true ORDER BY instrument_id;",
 }
 
 # Live board: CCY is derived from the chosen hedge instrument (hidden), so the single
-# instrument dropdown drives the board -- pick EUR_FGBL and the slopes follow EUR.
-# (The yield-curve panel overlays all four currencies and ignores CCY by design.)
-# Grafana re-evaluates it whenever INSTRUMENT changes.
+# instrument dropdown drives the WHOLE board -- pick EUR_FGBL and the curve, slopes and
+# tenors all follow EUR. Grafana re-evaluates it whenever INSTRUMENT changes.
 CCY_DERIVED_VAR = {
     "name": "CCY", "type": "query", "label": "ccy", "hide": 2,
     "datasource": DS, "refresh": 1, "includeAll": False, "multi": False,
@@ -366,7 +388,7 @@ CCY_DERIVED_VAR = {
 CCY_PICK_VAR = {
     "name": "CCY", "type": "query", "label": "currency", "hide": 0,
     "datasource": DS, "refresh": 1, "includeAll": False, "multi": False,
-    "current": {"text": "USD", "value": "USD"},
+    "current": {"text": "GBP", "value": "GBP"},
     "query": "SELECT DISTINCT ccy FROM g10_instruments ORDER BY ccy;",
     "definition": "SELECT DISTINCT ccy FROM g10_instruments ORDER BY ccy;",
 }

@@ -62,8 +62,8 @@
         "includeAll": false,
         "multi": false,
         "current": {
-          "text": "USD_ZN",
-          "value": "USD_ZN"
+          "text": "GBP_GLONG",
+          "value": "GBP_GLONG"
         },
         "query": "SELECT DISTINCT instrument_id FROM g10_instruments WHERE is_hedge = true ORDER BY instrument_id;",
         "definition": "SELECT DISTINCT instrument_id FROM g10_instruments WHERE is_hedge = true ORDER BY instrument_id;"
@@ -94,7 +94,7 @@
     {
       "id": 1,
       "type": "ae3e-plotly-panel",
-      "title": "Live G10 Yield Curves",
+      "title": "Live ${CCY} Yield Curve",
       "datasource": {
         "type": "questdb-questdb-datasource",
         "uid": "${DS_QUESTDB}"
@@ -118,7 +118,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT i.ccy, i.tenor_years, c.mid AS rate\nFROM (SELECT instrument_id, mid FROM g10_core_price LATEST ON timestamp PARTITION BY instrument_id) c\nJOIN g10_instruments i ON c.instrument_id = i.instrument_id\nWHERE i.price_space = 'rate'\nORDER BY i.ccy, i.tenor_years;",
+          "rawSql": "SELECT i.ccy, i.tenor_years, c.mid AS rate\nFROM (SELECT instrument_id, mid FROM g10_core_price WHERE timestamp <= now()\n      LATEST ON timestamp PARTITION BY instrument_id) c\nJOIN g10_instruments i ON c.instrument_id = i.instrument_id\nWHERE i.price_space = 'rate' AND i.ccy = '${CCY}'\nORDER BY i.tenor_years;",
           "refId": "A",
           "selectedFormat": 2
         }
@@ -151,7 +151,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "WITH snap AS (\n  SELECT timestamp, bids, asks FROM g10_market_data\n  WHERE instrument_id = '${INSTRUMENT}'\n  LATEST ON timestamp PARTITION BY instrument_id\n),\nbid_lvl AS (\n  SELECT 'bid' AS side, p.price AS price, v.vol AS volume\n  FROM snap, UNNEST(snap.bids[1]) WITH ORDINALITY p(price, lvl),\n             UNNEST(snap.bids[2]) WITH ORDINALITY v(vol, vlvl)\n  WHERE p.lvl = v.vlvl\n),\nask_lvl AS (\n  SELECT 'ask' AS side, p.price AS price, v.vol AS volume\n  FROM snap, UNNEST(snap.asks[1]) WITH ORDINALITY p(price, lvl),\n             UNNEST(snap.asks[2]) WITH ORDINALITY v(vol, vlvl)\n  WHERE p.lvl = v.vlvl\n),\nbid_cum AS (SELECT side, price, volume, SUM(volume) OVER (ORDER BY price DESC) AS cum_volume FROM bid_lvl),\nask_cum AS (SELECT side, price, volume, SUM(volume) OVER (ORDER BY price ASC) AS cum_volume FROM ask_lvl)\nSELECT * FROM bid_cum UNION ALL SELECT * FROM ask_cum ORDER BY side, price;",
+          "rawSql": "WITH snap AS (\n  SELECT timestamp, bids, asks FROM g10_market_data\n  WHERE instrument_id = '${INSTRUMENT}' AND timestamp <= now()\n  LATEST ON timestamp PARTITION BY instrument_id\n),\nbid_lvl AS (\n  SELECT 'bid' AS side, p.price AS price, v.vol AS volume\n  FROM snap, UNNEST(snap.bids[1]) WITH ORDINALITY p(price, lvl),\n             UNNEST(snap.bids[2]) WITH ORDINALITY v(vol, vlvl)\n  WHERE p.lvl = v.vlvl\n),\nask_lvl AS (\n  SELECT 'ask' AS side, p.price AS price, v.vol AS volume\n  FROM snap, UNNEST(snap.asks[1]) WITH ORDINALITY p(price, lvl),\n             UNNEST(snap.asks[2]) WITH ORDINALITY v(vol, vlvl)\n  WHERE p.lvl = v.vlvl\n),\nbid_cum AS (SELECT side, price, volume, SUM(volume) OVER (ORDER BY price DESC) AS cum_volume FROM bid_lvl),\nask_cum AS (SELECT side, price, volume, SUM(volume) OVER (ORDER BY price ASC) AS cum_volume FROM ask_lvl)\nSELECT * FROM bid_cum UNION ALL SELECT * FROM ask_cum ORDER BY side, price;",
           "refId": "A",
           "selectedFormat": 2
         }
@@ -266,7 +266,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "WITH m AS (\n  SELECT instrument_id, mid FROM g10_core_price\n  WHERE instrument_id IN ('${CCY}_OIS_2Y','${CCY}_OIS_5Y','${CCY}_OIS_10Y','${CCY}_OIS_30Y')\n  LATEST ON timestamp PARTITION BY instrument_id\n)\nSELECT\n  round((max(CASE WHEN instrument_id='${CCY}_OIS_10Y' THEN mid END)\n       - max(CASE WHEN instrument_id='${CCY}_OIS_2Y'  THEN mid END)) * 100, 1) AS \"2s10s bp\",\n  round((max(CASE WHEN instrument_id='${CCY}_OIS_30Y' THEN mid END)\n       - max(CASE WHEN instrument_id='${CCY}_OIS_5Y'  THEN mid END)) * 100, 1) AS \"5s30s bp\"\nFROM m;",
+          "rawSql": "WITH m AS (\n  SELECT instrument_id, mid FROM g10_core_price\n  WHERE instrument_id IN ('${CCY}_OIS_2Y','${CCY}_OIS_5Y','${CCY}_OIS_10Y','${CCY}_OIS_30Y')\n    AND timestamp <= now()\n  LATEST ON timestamp PARTITION BY instrument_id\n)\nSELECT\n  round((max(CASE WHEN instrument_id='${CCY}_OIS_10Y' THEN mid END)\n       - max(CASE WHEN instrument_id='${CCY}_OIS_2Y'  THEN mid END)) * 100, 1) AS \"2s10s bp\",\n  round((max(CASE WHEN instrument_id='${CCY}_OIS_30Y' THEN mid END)\n       - max(CASE WHEN instrument_id='${CCY}_OIS_5Y'  THEN mid END)) * 100, 1) AS \"5s30s bp\"\nFROM m;",
           "refId": "A",
           "selectedFormat": 2
         }
@@ -327,7 +327,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "WITH snap AS (\n  SELECT best_bid, best_ask, bids[2][1] AS bid_top, asks[2][1] AS ask_top\n  FROM g10_market_data\n  WHERE instrument_id = '${INSTRUMENT}'\n  LATEST ON timestamp PARTITION BY instrument_id\n)\nSELECT round((best_bid * ask_top + best_ask * bid_top) / (bid_top + ask_top), 5) AS \"Microprice\",\n       round(best_ask - best_bid, 5) AS \"Spread\"\nFROM snap;",
+          "rawSql": "WITH snap AS (\n  SELECT best_bid, best_ask, bids[2][1] AS bid_top, asks[2][1] AS ask_top\n  FROM g10_market_data\n  WHERE instrument_id = '${INSTRUMENT}' AND timestamp <= now()\n  LATEST ON timestamp PARTITION BY instrument_id\n)\nSELECT round((best_bid * ask_top + best_ask * bid_top) / (bid_top + ask_top), 5) AS \"Microprice\",\n       round(best_ask - best_bid, 5) AS \"Spread\"\nFROM snap;",
           "refId": "A",
           "selectedFormat": 2
         }
@@ -404,7 +404,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT round((array_sum(bids[2]) - array_sum(asks[2]))\n                        / (array_sum(bids[2]) + array_sum(asks[2])), 4) AS \"Imbalance\"\nFROM g10_market_data\nWHERE instrument_id = '${INSTRUMENT}'\nLATEST ON timestamp PARTITION BY instrument_id;",
+          "rawSql": "SELECT round((array_sum(bids[2]) - array_sum(asks[2]))\n                        / (array_sum(bids[2]) + array_sum(asks[2])), 4) AS \"Imbalance\"\nFROM g10_market_data\nWHERE instrument_id = '${INSTRUMENT}' AND timestamp <= now()\nLATEST ON timestamp PARTITION BY instrument_id;",
           "refId": "A",
           "selectedFormat": 2
         }

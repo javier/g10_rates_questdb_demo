@@ -43,13 +43,18 @@ day"). This is for show, not realism. Lower those constants for a calmer, more
 conservative tape.
 
 **Order-book depth.** Each `g10_market_data` snapshot is a coherent book, not fresh
-randomness: the number of levels and the per-level sizes are deterministic functions of
-`(instrument, second)`, so consecutive snapshots line up and the book holds its shape
-instead of flickering. Depth is characteristic per instrument (liquid futures deep, the
-belly deeper than the wings) and front-loaded (heaviest at the touch). Setting
-`--min_levels == --max_levels` pins every book to that fixed depth: backfill shallow
-(e.g. 2 levels) when only `count()`/tiering matters, then go live with `5..20` for the
-depth dashboard.
+randomness: the level count and per-level sizes are deterministic *continuous* functions of
+`(instrument, time)`. Sampled at the ~20+ snapshots/sec each instrument already emits, the
+book breathes smoothly sub-second instead of flickering or holding flat for a whole second.
+The level count evolves only slowly (the ladder shape is stable, with the odd level
+appearing or disappearing), while per-level sizes carry a faster ripple so the bars visibly
+move. The half-spread breathes on a liquidity cycle too, so the touch widens and narrows;
+that shows on instruments whose tick is fine relative to the spread (govvies, long bonds),
+while the most liquid futures stay pinned at one tick, as in reality. Depth is characteristic
+per instrument (liquid futures deep, the belly deeper than the wings) and front-loaded
+(heaviest at the touch). Setting `--min_levels == --max_levels` pins every book to that fixed
+depth: backfill shallow (e.g. 2 levels) when only `count()`/tiering matters, then go live
+with `5..20` for the depth dashboard.
 
 ## Tables and views
 
@@ -171,27 +176,39 @@ The split is deliberate: Grafana has one refresh interval per dashboard, so the 
 panels (100ms) and the heavy analytical queries (which cannot tick that fast) live apart.
 In the queries below, `${INSTRUMENT}` and `${CCY}` are Grafana template variables and
 `$__timeFilter(ts)` is Grafana's time-range macro. A single **hedge-instrument** dropdown
-drives the live board: depth/microprice/imbalance/candles follow the instrument, and a
-chained hidden `CCY` variable makes the slopes follow that instrument's currency. The
-yield-curve panel is the deliberate exception: it overlays all four G10 curves regardless
-of selection, as the market-overview chart. The desk board has its own **currency**
-dropdown.
+drives the whole live board: depth, microprice, imbalance and candles follow the instrument,
+and a chained hidden `CCY` variable makes the yield curve, slopes and key tenors follow that
+instrument's currency. The default is `GBP_GLONG` (the Long Gilt future), so the board opens
+on GBP. The desk board has its own **currency** dropdown (default `GBP`).
+
+**How the live panels stay live.** In real-time each pool flushes once per simulated second,
+but rows are stamped `--realtime_lookahead_secs` (default 2s) ahead of wall-clock, so the
+server always holds the next couple of seconds of sub-second snapshots. The `LATEST ON`
+panels bound to `timestamp <= now()`, so a 100ms refresh *sweeps* that buffer (the latest
+row at or before wall-clock, advancing every refresh) instead of snapping to the future
+edge, which would only move once per flush. Together with the continuously-breathing book,
+that is what makes depth and microprice glide at sub-second cadence without changing the
+flush rate.
 
 ### Live (`g10-rates-live`, 100ms)
 
 The execution view. Every panel is `LATEST ON` / `DESC LIMIT` or a materialized-view read,
 so it stays cheap at 100ms no matter how much history exists.
 
-**Live G10 yield curves** — last mid per rate instrument across all four currencies, joined
-to the dimension for its tenor, drawn as one colour-coded curve per currency (legend on
-top) against a log tenor axis (Plotly):
+**Live `${CCY}` yield curve** — last mid per rate instrument of the selected currency,
+joined to the dimension for its tenor, drawn against a log tenor axis (Plotly). Single
+currency on purpose: the Plotly y-axis auto-scales to that curve's ~100-120bp span instead
+of the ~450bp needed for all four, so the realistic ~2bp/min walk is actually visible as
+drift and reshape. The `now()` bound sweeps the lookahead buffer so it advances every
+refresh:
 
 ```sql
 SELECT i.ccy, i.tenor_years, c.mid AS rate
-FROM (SELECT instrument_id, mid FROM g10_core_price LATEST ON timestamp PARTITION BY instrument_id) c
+FROM (SELECT instrument_id, mid FROM g10_core_price WHERE timestamp <= now()
+      LATEST ON timestamp PARTITION BY instrument_id) c
 JOIN g10_instruments i ON c.instrument_id = i.instrument_id
-WHERE i.price_space = 'rate'
-ORDER BY i.ccy, i.tenor_years;
+WHERE i.price_space = 'rate' AND i.ccy = '${CCY}'
+ORDER BY i.tenor_years;
 ```
 
 **Market depth — `${INSTRUMENT}`** — the single latest book snapshot, `UNNEST WITH
@@ -201,7 +218,7 @@ count the snapshot carries, with a cumulative running sum per side (Plotly depth
 ```sql
 WITH snap AS (
   SELECT timestamp, bids, asks FROM g10_market_data
-  WHERE instrument_id = '${INSTRUMENT}'
+  WHERE instrument_id = '${INSTRUMENT}' AND timestamp <= now()
   LATEST ON timestamp PARTITION BY instrument_id
 ),
 bid_lvl AS (
@@ -236,6 +253,7 @@ WHERE $__timeFilter(timestamp) AND instrument_id = '${INSTRUMENT}';
 WITH m AS (
   SELECT instrument_id, mid FROM g10_core_price
   WHERE instrument_id IN ('${CCY}_OIS_2Y','${CCY}_OIS_5Y','${CCY}_OIS_10Y','${CCY}_OIS_30Y')
+    AND timestamp <= now()
   LATEST ON timestamp PARTITION BY instrument_id
 )
 SELECT
@@ -247,13 +265,16 @@ FROM m;
 ```
 
 **Microprice / spread — `${INSTRUMENT}`** — reads the stored scalar `best_bid`/`best_ask`
-columns and touches the array only for the level-1 sizes `bids[2][1]`/`asks[2][1]` (stat):
+columns and touches the array only for the level-1 sizes `bids[2][1]`/`asks[2][1]` (stat).
+The microprice glides continuously (the top-of-book sizes breathe even when the touch is
+pinned); the spread widens and narrows on instruments whose tick is fine relative to it, and
+sits at one tick on the most liquid futures, as in reality:
 
 ```sql
 WITH snap AS (
   SELECT best_bid, best_ask, bids[2][1] AS bid_top, asks[2][1] AS ask_top
   FROM g10_market_data
-  WHERE instrument_id = '${INSTRUMENT}'
+  WHERE instrument_id = '${INSTRUMENT}' AND timestamp <= now()
   LATEST ON timestamp PARTITION BY instrument_id
 )
 SELECT round((best_bid * ask_top + best_ask * bid_top) / (bid_top + ask_top), 5) AS "Microprice",
@@ -268,7 +289,7 @@ rows, no `UNNEST` or ladder expansion (gauge, -1..+1):
 SELECT round((array_sum(bids[2]) - array_sum(asks[2]))
            / (array_sum(bids[2]) + array_sum(asks[2])), 4) AS "Imbalance"
 FROM g10_market_data
-WHERE instrument_id = '${INSTRUMENT}'
+WHERE instrument_id = '${INSTRUMENT}' AND timestamp <= now()
 LATEST ON timestamp PARTITION BY instrument_id;
 ```
 
@@ -285,7 +306,21 @@ FROM g10_trades ORDER BY timestamp DESC LIMIT 25;
 ### Desk / Risk (`g10-rates-desk`, auto-refresh off)
 
 The analytical view, defaulting to yesterday's full session (static history, so no point
-re-running the heavy queries on a timer). Day-scale queries sample at 1m.
+re-running the heavy queries on a timer), currency `GBP`. Day-scale queries sample at 1m.
+
+**G10 yield curves (as of end of range)** — all four curves overlaid, bounded to the
+selected window via `$__timeFilter` + `LATEST ON`: the curve as of the right edge of the
+range (yesterday's close for the default, the current curve for trailing 2d/7d ranges). A
+static multi-currency overview, which suits an EOD review board (Plotly):
+
+```sql
+SELECT i.ccy, i.tenor_years, c.mid AS rate
+FROM (SELECT instrument_id, mid FROM g10_core_price WHERE $__timeFilter(timestamp)
+      LATEST ON timestamp PARTITION BY instrument_id) c
+JOIN g10_instruments i ON c.instrument_id = i.instrument_id
+WHERE i.price_space = 'rate'
+ORDER BY i.ccy, i.tenor_years;
+```
 
 **Joint Quote + Hedge** — the hero query: multi-way ASOF over dealt RFQs joining the curve
 mid and the running position, deriving quoted mid (skew off inventory) and the implied
