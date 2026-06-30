@@ -7,6 +7,23 @@ spanning order-book depth, curve mids, quotes, client requests, trades, position
 and risk. The tables are aligned so the central multi-way ASOF query returns
 consistent quotes and hedges.
 
+## Instrument universe
+
+76 instruments across four currencies (`USD`, `EUR`, `GBP`, `JPY`), each anchored to its
+RFR benchmark (`SOFR`, `ESTR`, `SONIA`, `TONA`). Three asset classes, defined in
+`G10Universe`:
+
+| Class | Count | Naming | Members |
+|---|---|---|---|
+| **OIS swaps** (rate space) | 48 | `{CCY}_OIS_{tenor}` | 12 pillars per currency: 1M, 3M, 6M, 1Y, 2Y, 3Y, 5Y, 7Y, 10Y, 15Y, 20Y, 30Y. The quotable curve; the 2Y-10Y belly is marked most liquid. |
+| **Govvies** (price space) | 16 | `{CCY}_{bench}_{tenor}` | On-the-run benchmarks, 2Y/5Y/10Y/30Y per currency: USTs (32nds), Schatz/Bobl/Bund/Buxl, Gilts, JGBs. The hedge leg. |
+| **Futures** (price space) | 12 | `{CCY}_{contract}` | USD/CME: `ZT ZF ZN TN ZB UB`; EUR/Eurex: `FGBS FGBM FGBL FGBX`; GBP/ICE: `GLONG`; JPY: `JGBL`. The most liquid hedge; the depth feed. |
+
+USTs and the CME futures quote in 32nds (`1/32`, futures in finer `1/128`-`1/64`
+fractions); Bund, Gilt and JGB complexes quote in `0.01`. Per-currency the default hedge
+instrument is the 10Y future (`USD_ZN`, `EUR_FGBL`, `GBP_GLONG`, `JPY_JGBL`), which the
+hero query uses to imply the hedge clip.
+
 ## Curve model
 
 What evolves over time is the yield curve, not each instrument on its own. Each
@@ -148,23 +165,184 @@ transport arrive asynchronously.
 
 Two Grafana dashboards, built and deployed by `grafana/deploy_dashboard.py` (and written
 to `grafana/g10_dashboard_live.json` / `g10_dashboard_desk.json` for manual import, in
-Grafana's portable "export for sharing" form so import prompts for the datasource):
-
-- **Live** (`g10-rates-live`, 100ms) the execution view. Every panel is `LATEST ON` /
-  `DESC LIMIT` or a materialized-view read, so it stays cheap at 100ms no matter how much
-  history exists: live yield curve, order-book depth, instrument price candles (off
-  `g10_curve_mid_1m`), curve slopes (2s10s / 5s30s), microprice, depth imbalance, and a
-  trade+hedge blotter. A single **hedge-instrument** dropdown drives the whole board:
-  depth/microprice/imbalance follow the instrument, and a chained hidden `CCY` variable
-  makes the curve and slopes follow that instrument's currency.
-- **Desk / Risk** (`g10-rates-desk`, auto-refresh off) the analytical view, defaulting to
-  yesterday's full session (static history, so no point re-running the heavy queries on a
-  timer). The multi-way ASOF Joint Quote + Hedge, cumulative position (trading book) DV01
-  by tenor bucket, and the key-tenor history. A **currency** dropdown drives it; day-scale
-  queries sample at 1m.
+Grafana's portable "export for sharing" form so import prompts for the datasource).
 
 The split is deliberate: Grafana has one refresh interval per dashboard, so the fast live
 panels (100ms) and the heavy analytical queries (which cannot tick that fast) live apart.
+In the queries below, `${INSTRUMENT}` and `${CCY}` are Grafana template variables and
+`$__timeFilter(ts)` is Grafana's time-range macro. A single **hedge-instrument** dropdown
+drives the whole live board: depth/microprice/imbalance/candles follow the instrument, and
+a chained hidden `CCY` variable makes the curve and slopes follow that instrument's
+currency. The desk board has its own **currency** dropdown.
+
+### Live (`g10-rates-live`, 100ms)
+
+The execution view. Every panel is `LATEST ON` / `DESC LIMIT` or a materialized-view read,
+so it stays cheap at 100ms no matter how much history exists.
+
+**Live `${CCY}` yield curve** — last mid per rate instrument, joined to the dimension for
+its tenor, drawn as one curve per currency (Plotly):
+
+```sql
+SELECT i.ccy, i.tenor_years, c.mid AS rate
+FROM (SELECT instrument_id, mid FROM g10_core_price LATEST ON timestamp PARTITION BY instrument_id) c
+JOIN g10_instruments i ON c.instrument_id = i.instrument_id
+WHERE i.price_space = 'rate' AND i.ccy = '${CCY}'
+ORDER BY i.tenor_years;
+```
+
+**Market depth — `${INSTRUMENT}`** — the single latest book snapshot, `UNNEST WITH
+ORDINALITY` over the price/size rows of the `DOUBLE[][]` so it adapts to whatever level
+count the snapshot carries, with a cumulative running sum per side (Plotly depth ladder):
+
+```sql
+WITH snap AS (
+  SELECT timestamp, bids, asks FROM g10_market_data
+  WHERE instrument_id = '${INSTRUMENT}'
+  LATEST ON timestamp PARTITION BY instrument_id
+),
+bid_lvl AS (
+  SELECT 'bid' AS side, p.price AS price, v.vol AS volume
+  FROM snap, UNNEST(snap.bids[1]) WITH ORDINALITY p(price, lvl),
+             UNNEST(snap.bids[2]) WITH ORDINALITY v(vol, vlvl)
+  WHERE p.lvl = v.vlvl
+),
+ask_lvl AS (
+  SELECT 'ask' AS side, p.price AS price, v.vol AS volume
+  FROM snap, UNNEST(snap.asks[1]) WITH ORDINALITY p(price, lvl),
+             UNNEST(snap.asks[2]) WITH ORDINALITY v(vol, vlvl)
+  WHERE p.lvl = v.vlvl
+),
+bid_cum AS (SELECT side, price, volume, SUM(volume) OVER (ORDER BY price DESC) AS cum_volume FROM bid_lvl),
+ask_cum AS (SELECT side, price, volume, SUM(volume) OVER (ORDER BY price ASC)  AS cum_volume FROM ask_lvl)
+SELECT * FROM bid_cum UNION ALL SELECT * FROM ask_cum ORDER BY side, price;
+```
+
+**`${INSTRUMENT}` price (1m candles)** — OHLC read straight from the materialized view, no
+raw scan (candlestick):
+
+```sql
+SELECT timestamp AS time, open, high, low, close
+FROM g10_curve_mid_1m
+WHERE $__timeFilter(timestamp) AND instrument_id = '${INSTRUMENT}';
+```
+
+**`${CCY}` curve slopes (bp)** — 2s10s and 5s30s from four `LATEST ON` mids (stat):
+
+```sql
+WITH m AS (
+  SELECT instrument_id, mid FROM g10_core_price
+  WHERE instrument_id IN ('${CCY}_OIS_2Y','${CCY}_OIS_5Y','${CCY}_OIS_10Y','${CCY}_OIS_30Y')
+  LATEST ON timestamp PARTITION BY instrument_id
+)
+SELECT
+  round((max(CASE WHEN instrument_id='${CCY}_OIS_10Y' THEN mid END)
+       - max(CASE WHEN instrument_id='${CCY}_OIS_2Y'  THEN mid END)) * 100, 1) AS "2s10s bp",
+  round((max(CASE WHEN instrument_id='${CCY}_OIS_30Y' THEN mid END)
+       - max(CASE WHEN instrument_id='${CCY}_OIS_5Y'  THEN mid END)) * 100, 1) AS "5s30s bp"
+FROM m;
+```
+
+**Microprice / spread — `${INSTRUMENT}`** — reads the stored scalar `best_bid`/`best_ask`
+columns and touches the array only for the level-1 sizes `bids[2][1]`/`asks[2][1]` (stat):
+
+```sql
+WITH snap AS (
+  SELECT best_bid, best_ask, bids[2][1] AS bid_top, asks[2][1] AS ask_top
+  FROM g10_market_data
+  WHERE instrument_id = '${INSTRUMENT}'
+  LATEST ON timestamp PARTITION BY instrument_id
+)
+SELECT round((best_bid * ask_top + best_ask * bid_top) / (bid_top + ask_top), 5) AS "Microprice",
+       round(best_ask - best_bid, 5) AS "Spread"
+FROM snap;
+```
+
+**Depth imbalance — `${INSTRUMENT}`** — total size each side via `array_sum()` on the size
+rows, no `UNNEST` or ladder expansion (gauge, -1..+1):
+
+```sql
+SELECT round((array_sum(bids[2]) - array_sum(asks[2]))
+           / (array_sum(bids[2]) + array_sum(asks[2])), 4) AS "Imbalance"
+FROM g10_market_data
+WHERE instrument_id = '${INSTRUMENT}'
+LATEST ON timestamp PARTITION BY instrument_id;
+```
+
+**Trade + hedge blotter (latest 25)** — straight `DESC LIMIT` tail of the trades table
+(table):
+
+```sql
+SELECT timestamp AS "Time", instrument_id AS "Instrument", ccy AS "Ccy",
+  side AS "Side", notional AS "Notional", round(price, 4) AS "Price",
+  client_id AS "Client", book AS "Book"
+FROM g10_trades ORDER BY timestamp DESC LIMIT 25;
+```
+
+### Desk / Risk (`g10-rates-desk`, auto-refresh off)
+
+The analytical view, defaulting to yesterday's full session (static history, so no point
+re-running the heavy queries on a timer). Day-scale queries sample at 1m.
+
+**Joint Quote + Hedge** — the hero query: multi-way ASOF over dealt RFQs joining the curve
+mid and the running position, deriving quoted mid (skew off inventory) and the implied
+hedge clip in the currency's 10Y future (table):
+
+```sql
+WITH pos AS (
+  SELECT timestamp, book, instrument_id, net_notional FROM g10_positions ORDER BY timestamp ASC
+)
+SELECT r.timestamp AS "Time", r.instrument_id AS "Instrument", r.ccy AS "Ccy",
+  r.side AS "Client", r.notional AS "Notional",
+  round(m.mid, 4) AS "Curve mid", p.net_notional AS "Position",
+  round(p.net_notional * i.dv01_per_unit, 0) AS "Bucket DV01",
+  round(m.mid + (-p.net_notional / 5.0e8) * 0.0001, 5) AS "Quoted mid",
+  round(-(p.net_notional * i.dv01_per_unit) / NULLIF(h.dv01_per_unit, 0), 0) AS "Implied hedge"
+FROM g10_rfqs r
+ASOF JOIN g10_core_price m ON (r.instrument_id = m.instrument_id)
+ASOF JOIN pos p ON (r.instrument_id = p.instrument_id)
+JOIN g10_instruments i ON r.instrument_id = i.instrument_id
+LEFT JOIN g10_instruments h ON h.instrument_id = (
+  CASE i.ccy WHEN 'USD' THEN 'USD_ZN' WHEN 'EUR' THEN 'EUR_FGBL'
+             WHEN 'GBP' THEN 'GBP_GLONG' ELSE 'JPY_JGBL' END)
+WHERE $__timeFilter(r.timestamp) AND r.status = 'dealt' AND p.net_notional IS NOT NULL
+ORDER BY r.timestamp DESC LIMIT 20;
+```
+
+**Cumulative position (trading book) DV01 by tenor bucket — `${CCY}`** — the `g10_pos_risk`
+matview's per-interval DV01 flow, accumulated with a window sum and pivoted to one column
+per bucket (timeseries):
+
+```sql
+WITH f AS (
+  SELECT timestamp, tenor_bucket, sum(dv01_flow) AS dv01
+  FROM g10_pos_risk WHERE $__timeFilter(timestamp) AND ccy = '${CCY}' SAMPLE BY 1m
+), c AS (
+  SELECT timestamp, tenor_bucket,
+    sum(dv01) OVER (PARTITION BY tenor_bucket ORDER BY timestamp) AS cum
+  FROM f
+)
+SELECT timestamp AS time,
+  last(CASE WHEN tenor_bucket = '1-3Y'   THEN cum END) AS "1-3Y",
+  last(CASE WHEN tenor_bucket = '3-7Y'   THEN cum END) AS "3-7Y",
+  last(CASE WHEN tenor_bucket = '7-15Y'  THEN cum END) AS "7-15Y",
+  last(CASE WHEN tenor_bucket = '15-30Y' THEN cum END) AS "15-30Y"
+FROM c SAMPLE BY 1m;
+```
+
+**`${CCY}` curve - key tenors (1m)** — 2Y/5Y/10Y/30Y OIS mids, sampled at 1m (timeseries):
+
+```sql
+SELECT timestamp AS time,
+  last(CASE WHEN instrument_id = '${CCY}_OIS_2Y'  THEN mid END) AS "${CCY} 2Y",
+  last(CASE WHEN instrument_id = '${CCY}_OIS_5Y'  THEN mid END) AS "${CCY} 5Y",
+  last(CASE WHEN instrument_id = '${CCY}_OIS_10Y' THEN mid END) AS "${CCY} 10Y",
+  last(CASE WHEN instrument_id = '${CCY}_OIS_30Y' THEN mid END) AS "${CCY} 30Y"
+FROM g10_core_price
+WHERE $__timeFilter(timestamp)
+  AND instrument_id IN ('${CCY}_OIS_2Y','${CCY}_OIS_5Y','${CCY}_OIS_10Y','${CCY}_OIS_30Y')
+SAMPLE BY 1m;
+```
 
 The matview-backed panels (desk DV01, live candles) read views with a 10-day TTL, so the
 desk board reaches back about ten days. To change that, edit the TTL in the generator and
