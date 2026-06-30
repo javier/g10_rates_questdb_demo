@@ -172,24 +172,34 @@ WHERE $__timeFilter(timestamp)
   AND instrument_id IN ('${CCY}_OIS_2Y','${CCY}_OIS_5Y','${CCY}_OIS_10Y','${CCY}_OIS_30Y')
 SAMPLE BY 1m;"""
 
+# Pre-limit the driver BEFORE the joins: `deals` takes the last 25 dealt RFQs in the
+# selected window (LIMIT -25 keeps ascending order, which ASOF needs), with a buffer (-50)
+# so the post-join `net_notional IS NOT NULL` drop comfortably still leaves 25. The ASOF/
+# lookup joins then run on ~50 rows instead of every dealt RFQ in the range (thousands/day).
 HERO_SQL = """WITH pos AS (
   SELECT timestamp, book, instrument_id, net_notional FROM g10_positions ORDER BY timestamp ASC
+),
+deals AS (
+  SELECT timestamp, instrument_id, ccy, side, notional
+  FROM g10_rfqs
+  WHERE $__timeFilter(timestamp) AND status = 'dealt'
+  LIMIT -50
 )
-SELECT r.timestamp AS "Time", r.instrument_id AS "Instrument", r.ccy AS "Ccy",
-  r.side AS "Client", r.notional AS "Notional",
+SELECT d.timestamp AS "Time", d.instrument_id AS "Instrument", d.ccy AS "Ccy",
+  d.side AS "Client", d.notional AS "Notional",
   round(m.mid, 4) AS "Curve mid", p.net_notional AS "Position",
   round(p.net_notional * i.dv01_per_unit, 0) AS "Bucket DV01",
   round(m.mid + (-p.net_notional / 5.0e8) * 0.0001, 5) AS "Quoted mid",
   round(-(p.net_notional * i.dv01_per_unit) / NULLIF(h.dv01_per_unit, 0), 0) AS "Implied hedge"
-FROM g10_rfqs r
-ASOF JOIN g10_core_price m ON (r.instrument_id = m.instrument_id)
-ASOF JOIN pos p ON (r.instrument_id = p.instrument_id)
-JOIN g10_instruments i ON r.instrument_id = i.instrument_id
+FROM deals d
+ASOF JOIN g10_core_price m ON (d.instrument_id = m.instrument_id)
+ASOF JOIN pos p ON (d.instrument_id = p.instrument_id)
+JOIN g10_instruments i ON d.instrument_id = i.instrument_id
 LEFT JOIN g10_instruments h ON h.instrument_id = (
   CASE i.ccy WHEN 'USD' THEN 'USD_ZN' WHEN 'EUR' THEN 'EUR_FGBL'
              WHEN 'GBP' THEN 'GBP_GLONG' ELSE 'JPY_JGBL' END)
-WHERE $__timeFilter(r.timestamp) AND r.status = 'dealt' AND p.net_notional IS NOT NULL
-ORDER BY r.timestamp DESC LIMIT 20;"""
+WHERE p.net_notional IS NOT NULL
+ORDER BY d.timestamp DESC LIMIT 25;"""
 
 # Candles read the engine-maintained 1m OHLC materialized view (g10_curve_mid_1m)
 # rather than scanning raw core_price -- faster, and it showcases the MV.

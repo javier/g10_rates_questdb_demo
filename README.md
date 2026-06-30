@@ -324,27 +324,36 @@ ORDER BY i.ccy, i.tenor_years;
 
 **Joint Quote + Hedge** — the hero query: multi-way ASOF over dealt RFQs joining the curve
 mid and the running position, deriving quoted mid (skew off inventory) and the implied
-hedge clip in the currency's 10Y future (table):
+hedge clip in the currency's 10Y future (table). The driver is pre-limited *before* the
+joins: `deals` takes the last 25 dealt RFQs in the window (`LIMIT -25` keeps ascending
+order, which ASOF needs; a `-50` buffer absorbs the post-join null drop), so the joins run
+on ~50 rows instead of every dealt RFQ in the range:
 
 ```sql
 WITH pos AS (
   SELECT timestamp, book, instrument_id, net_notional FROM g10_positions ORDER BY timestamp ASC
+),
+deals AS (
+  SELECT timestamp, instrument_id, ccy, side, notional
+  FROM g10_rfqs
+  WHERE $__timeFilter(timestamp) AND status = 'dealt'
+  LIMIT -50
 )
-SELECT r.timestamp AS "Time", r.instrument_id AS "Instrument", r.ccy AS "Ccy",
-  r.side AS "Client", r.notional AS "Notional",
+SELECT d.timestamp AS "Time", d.instrument_id AS "Instrument", d.ccy AS "Ccy",
+  d.side AS "Client", d.notional AS "Notional",
   round(m.mid, 4) AS "Curve mid", p.net_notional AS "Position",
   round(p.net_notional * i.dv01_per_unit, 0) AS "Bucket DV01",
   round(m.mid + (-p.net_notional / 5.0e8) * 0.0001, 5) AS "Quoted mid",
   round(-(p.net_notional * i.dv01_per_unit) / NULLIF(h.dv01_per_unit, 0), 0) AS "Implied hedge"
-FROM g10_rfqs r
-ASOF JOIN g10_core_price m ON (r.instrument_id = m.instrument_id)
-ASOF JOIN pos p ON (r.instrument_id = p.instrument_id)
-JOIN g10_instruments i ON r.instrument_id = i.instrument_id
+FROM deals d
+ASOF JOIN g10_core_price m ON (d.instrument_id = m.instrument_id)
+ASOF JOIN pos p ON (d.instrument_id = p.instrument_id)
+JOIN g10_instruments i ON d.instrument_id = i.instrument_id
 LEFT JOIN g10_instruments h ON h.instrument_id = (
   CASE i.ccy WHEN 'USD' THEN 'USD_ZN' WHEN 'EUR' THEN 'EUR_FGBL'
              WHEN 'GBP' THEN 'GBP_GLONG' ELSE 'JPY_JGBL' END)
-WHERE $__timeFilter(r.timestamp) AND r.status = 'dealt' AND p.net_notional IS NOT NULL
-ORDER BY r.timestamp DESC LIMIT 20;
+WHERE p.net_notional IS NOT NULL
+ORDER BY d.timestamp DESC LIMIT 25;
 ```
 
 **Cumulative position (trading book) DV01 by tenor bucket — `${CCY}`** — the `g10_pos_risk`
