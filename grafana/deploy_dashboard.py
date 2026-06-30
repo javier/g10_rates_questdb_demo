@@ -117,29 +117,36 @@ for (let i = 0; i < ccy.length; i++) {
   (byCcy[ccy[i]] = byCcy[ccy[i]] || { x: [], y: [] });
   byCcy[ccy[i]].x.push(ten[i]); byCcy[ccy[i]].y.push(rate[i]);
 }
-const colors = { USD: "#4FC3F7", EUR: "#FFB74D", GBP: "#81C784", JPY: "#E57373" };
-const traces = Object.keys(byCcy).map(c => ({
+// Well-separated hues on black: blue / orange / violet / red, so no two curves
+// read alike even where they sit at the same level (USD and GBP both near the top).
+const colors = { USD: "#4FC3F7", EUR: "#FFB74D", GBP: "#CE93D8", JPY: "#E57373" };
+const order = ["USD", "EUR", "GBP", "JPY"];
+const traces = order.filter(c => byCcy[c]).map(c => ({
   name: c, x: byCcy[c].x, y: byCcy[c].y, mode: "lines+markers", type: "scatter",
   line: { width: 2, color: colors[c] || "white" }, marker: { size: 5 }
 }));
 return {
   data: traces,
   layout: { plot_bgcolor: "black", paper_bgcolor: "black", font: { color: "white" },
-    showlegend: false,
+    showlegend: true,
+    legend: { orientation: "h", x: 0.5, xanchor: "center", y: 1.14, yanchor: "bottom",
+      font: { color: "white" } },
     xaxis: { title: "Tenor", type: "log", tickmode: "array",
       tickvals: [0.25, 0.5, 1, 2, 3, 5, 7, 10, 20, 30],
       ticktext: ["3M", "6M", "1Y", "2Y", "3Y", "5Y", "7Y", "10Y", "20Y", "30Y"],
       showgrid: true, gridcolor: "rgba(255,255,255,0.1)" },
     yaxis: { title: "Rate (%)", showgrid: true, gridcolor: "rgba(255,255,255,0.1)" },
-    margin: { t: 20, l: 50, r: 20, b: 40 } }
+    margin: { t: 36, l: 50, r: 20, b: 40 } }
 };
 """
 
+# All four G10 curves overlaid (no currency filter) -- this is the market-overview
+# panel, so breadth beats focus; the per-instrument currency still drives slopes/tenors.
 CURVE_SQL = """SELECT i.ccy, i.tenor_years, c.mid AS rate
 FROM (SELECT instrument_id, mid FROM g10_core_price LATEST ON timestamp PARTITION BY instrument_id) c
 JOIN g10_instruments i ON c.instrument_id = i.instrument_id
-WHERE i.price_space = 'rate' AND i.ccy = '${CCY}'
-ORDER BY i.tenor_years;"""
+WHERE i.price_space = 'rate'
+ORDER BY i.ccy, i.tenor_years;"""
 
 TENORS_SQL = """SELECT timestamp AS time,
   last(CASE WHEN instrument_id = '${CCY}_OIS_2Y'  THEN mid END) AS "${CCY} 2Y",
@@ -312,7 +319,7 @@ FROM g10_trades ORDER BY timestamp DESC LIMIT 25;"""
 
 # --- Live board: LATEST ON / DESC LIMIT panels + MV-backed candles -> ticks at 100ms ---
 live_panels = [
-    plotly_panel(1, "Live ${CCY} Yield Curve", CURVE_SQL, CURVE_SCRIPT,
+    plotly_panel(1, "Live G10 Yield Curves", CURVE_SQL, CURVE_SCRIPT,
                  {"h": 7, "w": 24, "x": 0, "y": 0}),
     plotly_panel(2, "Market Depth - ${INSTRUMENT}", DEPTH_SQL, DEPTH_SCRIPT,
                  {"h": 11, "w": 12, "x": 0, "y": 7}),
@@ -345,8 +352,9 @@ INSTRUMENT_VAR = {
 }
 
 # Live board: CCY is derived from the chosen hedge instrument (hidden), so the single
-# instrument dropdown drives the whole board -- pick EUR_FGBL and the curve, slopes and
-# tenors all follow EUR. Grafana re-evaluates it whenever INSTRUMENT changes.
+# instrument dropdown drives the board -- pick EUR_FGBL and the slopes follow EUR.
+# (The yield-curve panel overlays all four currencies and ignores CCY by design.)
+# Grafana re-evaluates it whenever INSTRUMENT changes.
 CCY_DERIVED_VAR = {
     "name": "CCY", "type": "query", "label": "ccy", "hide": 2,
     "datasource": DS, "refresh": 1, "includeAll": False, "multi": False,

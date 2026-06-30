@@ -171,24 +171,27 @@ The split is deliberate: Grafana has one refresh interval per dashboard, so the 
 panels (100ms) and the heavy analytical queries (which cannot tick that fast) live apart.
 In the queries below, `${INSTRUMENT}` and `${CCY}` are Grafana template variables and
 `$__timeFilter(ts)` is Grafana's time-range macro. A single **hedge-instrument** dropdown
-drives the whole live board: depth/microprice/imbalance/candles follow the instrument, and
-a chained hidden `CCY` variable makes the curve and slopes follow that instrument's
-currency. The desk board has its own **currency** dropdown.
+drives the live board: depth/microprice/imbalance/candles follow the instrument, and a
+chained hidden `CCY` variable makes the slopes follow that instrument's currency. The
+yield-curve panel is the deliberate exception: it overlays all four G10 curves regardless
+of selection, as the market-overview chart. The desk board has its own **currency**
+dropdown.
 
 ### Live (`g10-rates-live`, 100ms)
 
 The execution view. Every panel is `LATEST ON` / `DESC LIMIT` or a materialized-view read,
 so it stays cheap at 100ms no matter how much history exists.
 
-**Live `${CCY}` yield curve** — last mid per rate instrument, joined to the dimension for
-its tenor, drawn as one curve per currency (Plotly):
+**Live G10 yield curves** — last mid per rate instrument across all four currencies, joined
+to the dimension for its tenor, drawn as one colour-coded curve per currency (legend on
+top) against a log tenor axis (Plotly):
 
 ```sql
 SELECT i.ccy, i.tenor_years, c.mid AS rate
 FROM (SELECT instrument_id, mid FROM g10_core_price LATEST ON timestamp PARTITION BY instrument_id) c
 JOIN g10_instruments i ON c.instrument_id = i.instrument_id
-WHERE i.price_space = 'rate' AND i.ccy = '${CCY}'
-ORDER BY i.tenor_years;
+WHERE i.price_space = 'rate'
+ORDER BY i.ccy, i.tenor_years;
 ```
 
 **Market depth — `${INSTRUMENT}`** — the single latest book snapshot, `UNNEST WITH

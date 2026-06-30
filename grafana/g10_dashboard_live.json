@@ -94,7 +94,7 @@
     {
       "id": 1,
       "type": "ae3e-plotly-panel",
-      "title": "Live ${CCY} Yield Curve",
+      "title": "Live G10 Yield Curves",
       "datasource": {
         "type": "questdb-questdb-datasource",
         "uid": "${DS_QUESTDB}"
@@ -107,7 +107,7 @@
       },
       "pluginVersion": "0.5.0",
       "options": {
-        "script": "\nconst t = data.series[0], f = t.fields;\nconst ccy = f.find(x => x.name === \"ccy\").values.toArray();\nconst ten = f.find(x => x.name === \"tenor_years\").values.toArray();\nconst rate = f.find(x => x.name === \"rate\").values.toArray();\nconst byCcy = {};\nfor (let i = 0; i < ccy.length; i++) {\n  (byCcy[ccy[i]] = byCcy[ccy[i]] || { x: [], y: [] });\n  byCcy[ccy[i]].x.push(ten[i]); byCcy[ccy[i]].y.push(rate[i]);\n}\nconst colors = { USD: \"#4FC3F7\", EUR: \"#FFB74D\", GBP: \"#81C784\", JPY: \"#E57373\" };\nconst traces = Object.keys(byCcy).map(c => ({\n  name: c, x: byCcy[c].x, y: byCcy[c].y, mode: \"lines+markers\", type: \"scatter\",\n  line: { width: 2, color: colors[c] || \"white\" }, marker: { size: 5 }\n}));\nreturn {\n  data: traces,\n  layout: { plot_bgcolor: \"black\", paper_bgcolor: \"black\", font: { color: \"white\" },\n    showlegend: false,\n    xaxis: { title: \"Tenor\", type: \"log\", tickmode: \"array\",\n      tickvals: [0.25, 0.5, 1, 2, 3, 5, 7, 10, 20, 30],\n      ticktext: [\"3M\", \"6M\", \"1Y\", \"2Y\", \"3Y\", \"5Y\", \"7Y\", \"10Y\", \"20Y\", \"30Y\"],\n      showgrid: true, gridcolor: \"rgba(255,255,255,0.1)\" },\n    yaxis: { title: \"Rate (%)\", showgrid: true, gridcolor: \"rgba(255,255,255,0.1)\" },\n    margin: { t: 20, l: 50, r: 20, b: 40 } }\n};\n",
+        "script": "\nconst t = data.series[0], f = t.fields;\nconst ccy = f.find(x => x.name === \"ccy\").values.toArray();\nconst ten = f.find(x => x.name === \"tenor_years\").values.toArray();\nconst rate = f.find(x => x.name === \"rate\").values.toArray();\nconst byCcy = {};\nfor (let i = 0; i < ccy.length; i++) {\n  (byCcy[ccy[i]] = byCcy[ccy[i]] || { x: [], y: [] });\n  byCcy[ccy[i]].x.push(ten[i]); byCcy[ccy[i]].y.push(rate[i]);\n}\n// Well-separated hues on black: blue / orange / violet / red, so no two curves\n// read alike even where they sit at the same level (USD and GBP both near the top).\nconst colors = { USD: \"#4FC3F7\", EUR: \"#FFB74D\", GBP: \"#CE93D8\", JPY: \"#E57373\" };\nconst order = [\"USD\", \"EUR\", \"GBP\", \"JPY\"];\nconst traces = order.filter(c => byCcy[c]).map(c => ({\n  name: c, x: byCcy[c].x, y: byCcy[c].y, mode: \"lines+markers\", type: \"scatter\",\n  line: { width: 2, color: colors[c] || \"white\" }, marker: { size: 5 }\n}));\nreturn {\n  data: traces,\n  layout: { plot_bgcolor: \"black\", paper_bgcolor: \"black\", font: { color: \"white\" },\n    showlegend: true,\n    legend: { orientation: \"h\", x: 0.5, xanchor: \"center\", y: 1.14, yanchor: \"bottom\",\n      font: { color: \"white\" } },\n    xaxis: { title: \"Tenor\", type: \"log\", tickmode: \"array\",\n      tickvals: [0.25, 0.5, 1, 2, 3, 5, 7, 10, 20, 30],\n      ticktext: [\"3M\", \"6M\", \"1Y\", \"2Y\", \"3Y\", \"5Y\", \"7Y\", \"10Y\", \"20Y\", \"30Y\"],\n      showgrid: true, gridcolor: \"rgba(255,255,255,0.1)\" },\n    yaxis: { title: \"Rate (%)\", showgrid: true, gridcolor: \"rgba(255,255,255,0.1)\" },\n    margin: { t: 36, l: 50, r: 20, b: 40 } }\n};\n",
         "onclick": ""
       },
       "targets": [
@@ -118,7 +118,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT i.ccy, i.tenor_years, c.mid AS rate\nFROM (SELECT instrument_id, mid FROM g10_core_price LATEST ON timestamp PARTITION BY instrument_id) c\nJOIN g10_instruments i ON c.instrument_id = i.instrument_id\nWHERE i.price_space = 'rate' AND i.ccy = '${CCY}'\nORDER BY i.tenor_years;",
+          "rawSql": "SELECT i.ccy, i.tenor_years, c.mid AS rate\nFROM (SELECT instrument_id, mid FROM g10_core_price LATEST ON timestamp PARTITION BY instrument_id) c\nJOIN g10_instruments i ON c.instrument_id = i.instrument_id\nWHERE i.price_space = 'rate'\nORDER BY i.ccy, i.tenor_years;",
           "refId": "A",
           "selectedFormat": 2
         }
