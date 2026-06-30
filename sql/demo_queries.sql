@@ -22,12 +22,20 @@ SELECT * FROM g10_rfqs         ORDER BY timestamp DESC LIMIT 50; -- inbound requ
 SELECT * FROM g10_trades       ORDER BY timestamp DESC LIMIT 50; -- fills (client + hedge)
 SELECT * FROM g10_axes         ORDER BY timestamp DESC LIMIT 50; -- directional interest
 
--- Volume shape: market_data >> core_price > quotes > trades
+-- Volume shape (whole dataset): market_data >> core_price > quotes > trades
 SELECT 'market_data' t, count() c FROM g10_market_data
 UNION ALL SELECT 'core_price', count() FROM g10_core_price
 UNION ALL SELECT 'quotes',     count() FROM g10_quotes
 UNION ALL SELECT 'rfqs',       count() FROM g10_rfqs
 UNION ALL SELECT 'trades',     count() FROM g10_trades
+ORDER BY c DESC;
+
+-- ...and a single full day in isolation (each branch filtered to yesterday's session)
+SELECT 'market_data' t, count() c FROM g10_market_data WHERE timestamp IN '$yesterday'
+UNION ALL SELECT 'core_price', count() FROM g10_core_price WHERE timestamp IN '$yesterday'
+UNION ALL SELECT 'quotes',     count() FROM g10_quotes     WHERE timestamp IN '$yesterday'
+UNION ALL SELECT 'rfqs',       count() FROM g10_rfqs       WHERE timestamp IN '$yesterday'
+UNION ALL SELECT 'trades',     count() FROM g10_trades     WHERE timestamp IN '$yesterday'
 ORDER BY c DESC;
 
 -- Two quote populations, made explicit by quote_type
@@ -46,9 +54,9 @@ SELECT * FROM g10_market_data WHERE instrument_id = 'USD_ZN' AND timestamp IN '$
 -- 3. Depth-of-book arrays (bids/asks are DOUBLE[][] of shape [2][levels])
 -- ---------------------------------------------------------------------------
 SELECT timestamp, instrument_id,
-    bids[1,1] AS bid_px, bids[2,1] AS bid_sz,         -- level 1
-    asks[1,1] AS ask_px, asks[2,1] AS ask_sz,
-    bids[1,-1] AS worst_bid_px, asks[1,-1] AS worst_ask_px,  -- deepest level
+    best_bid AS bid_px, bids[2,1] AS bid_sz,          -- top price from the column, size from the array
+    best_ask AS ask_px, asks[2,1] AS ask_sz,
+    bids[1,-1] AS worst_bid_px, asks[1,-1] AS worst_ask_px,  -- deepest level (array only)
     array_sum(bids[2]) AS total_bid_vol,
     array_sum(asks[2]) AS total_ask_vol
 FROM g10_market_data WHERE timestamp IN '$today' LIMIT -20;
@@ -95,21 +103,38 @@ FROM hourly h JOIN parts p ON to_str(h.timestamp, 'yyyy-MM-ddTHH') = p.name
 ORDER BY h.timestamp;
 
 -- ---------------------------------------------------------------------------
--- 7. SAMPLE BY (xbar): curve-mid candles
+-- 7. SAMPLE BY (xbar) -> materialized view: stop re-running the same rollup
 -- ---------------------------------------------------------------------------
+-- 7a. The 1m curve-mid candles as a plain query -- scans core_price on every run.
 SELECT timestamp, instrument_id,
     first(mid) AS open, max(mid) AS high, min(mid) AS low, last(mid) AS close
 FROM g10_core_price
-WHERE instrument_id = 'USD_OIS_10Y' AND timestamp IN '$today'
+WHERE instrument_id = 'USD_OIS_10Y' AND timestamp IN '$yesterday'
 SAMPLE BY 1m;
 
+-- 7b. Wrap that exact aggregation in a materialized view (created once; the engine
+--     refreshes it incrementally as new rows arrive).
+CREATE MATERIALIZED VIEW IF NOT EXISTS g10_demo_mid_1m WITH BASE g10_core_price REFRESH IMMEDIATE AS (
+    SELECT timestamp, instrument_id,
+        first(mid) AS open, max(mid) AS high, min(mid) AS low, last(mid) AS close
+    FROM g10_core_price SAMPLE BY 1m
+) PARTITION BY HOUR;
+
+-- 7c. Same result, now a pre-aggregated read instead of a scan. Run 7a and 7c and
+--     compare the execution times.
+SELECT * FROM g10_demo_mid_1m
+WHERE instrument_id = 'USD_OIS_10Y' AND timestamp IN '$yesterday';
+
 -- ---------------------------------------------------------------------------
--- 8. Materialized views (engine-maintained rollups + risk)
+-- 8. The shipped materialized views (same pattern, maintained continuously)
 -- ---------------------------------------------------------------------------
 materialized_views();
 SELECT * FROM g10_curve_mid_1m WHERE instrument_id = 'USD_OIS_10Y' ORDER BY timestamp DESC LIMIT 10;
-SELECT * FROM g10_bbo_1m       ORDER BY timestamp DESC LIMIT 10;
+SELECT * FROM g10_bbo_1m       ORDER BY timestamp DESC LIMIT 10;   -- best bid/offer over depth
 SELECT * FROM g10_pos_risk     ORDER BY timestamp DESC LIMIT 10;   -- DV01 FLOW per 1s bucket
+-- The win scales with the base table: the same SAMPLE BY over g10_market_data would scan a
+-- full day (~830M rows); g10_bbo_1m answers it from a few thousand maintained rows.
+-- Tidy up the demo view from section 7: DROP MATERIALIZED VIEW g10_demo_mid_1m;
 
 -- ---------------------------------------------------------------------------
 -- 9. Positions (stock) and PosRisk (flow vs stock)
@@ -155,7 +180,7 @@ LEFT JOIN g10_axes a        ON (r.instrument_id = a.instrument_id)
 LEFT JOIN g10_instruments h ON h.instrument_id = (
     CASE i.ccy WHEN 'USD' THEN 'USD_ZN' WHEN 'EUR' THEN 'EUR_FGBL'
                WHEN 'GBP' THEN 'GBP_GLONG' ELSE 'JPY_JGBL' END)
-WHERE r.status = 'dealt'
+WHERE r.status = 'dealt' AND r.timestamp IN '$yesterday'
 LIMIT 50;
 
 -- ---------------------------------------------------------------------------
@@ -177,7 +202,7 @@ SELECT r.timestamp, r.rfq_id, r.instrument_id,
 FROM g10_rfqs r
 WINDOW JOIN g10_core_price c ON (r.instrument_id = c.instrument_id)
     RANGE BETWEEN 5 seconds PRECEDING AND 5 seconds FOLLOWING
-WHERE r.timestamp IN '$today';
+WHERE r.timestamp IN '$yesterday';
 
 -- ---------------------------------------------------------------------------
 -- 13. HORIZON JOIN: markout of client fills against the mid at fixed horizons.
@@ -187,7 +212,7 @@ SELECT t.instrument_id, h.offset / 1000000000 AS horizon_sec, count() AS n,
 FROM g10_trades t
 HORIZON JOIN g10_core_price m ON (t.instrument_id = m.instrument_id)
     LIST (0, 1s, 5s, 30s, 1m) AS h
-WHERE t.is_hedge = false AND t.timestamp IN '$today'
+WHERE t.is_hedge = false AND t.timestamp IN '$yesterday'
 GROUP BY t.instrument_id, horizon_sec
 ORDER BY t.instrument_id, horizon_sec;
 
@@ -195,10 +220,10 @@ ORDER BY t.instrument_id, horizon_sec;
 -- 14. Order-book analytics on a hedge instrument: how large a hedge can I lift
 --     within 2 ticks, and what price does a given clip reach?
 -- ---------------------------------------------------------------------------
--- Volume available within ~2 ticks of the best ask
+-- Volume available within ~2 ticks of the best ask (best_ask from the column)
 SELECT timestamp, instrument_id,
-    asks[2, 1:insertion_point(asks[1], asks[1,1] + 2 * 0.015625)] AS reachable_sizes,
-    array_sum(asks[2, 1:insertion_point(asks[1], asks[1,1] + 2 * 0.015625)]) AS reachable_volume
+    asks[2, 1:insertion_point(asks[1], best_ask + 2 * 0.015625)] AS reachable_sizes,
+    array_sum(asks[2, 1:insertion_point(asks[1], best_ask + 2 * 0.015625)]) AS reachable_volume
 FROM g10_market_data WHERE instrument_id = 'USD_ZN' LATEST ON timestamp PARTITION BY instrument_id;
 
 -- What price level does a buy of 5,000,000 reach?
